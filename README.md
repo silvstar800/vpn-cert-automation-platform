@@ -1,130 +1,123 @@
-# 🔐 SSL VPN Automation & Network Operations Platform
+# SSL VPN 인증서 및 운영 자동화 플랫폼
 
-## 📌 Overview
-멀티 장비 환경(Sophos UTM9 → SFOS 전환)에서 VPN 인증서 발급, 네트워크 정책 관리, 모니터링을 자동화하기 위해 구축한 보안 운영 플랫폼입니다.
+OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선스 관리, 백업 검증, 보안 모니터링을 통합한 운영 포털 프로젝트입니다.
 
-기존 수작업 기반 운영을 개선하여, 인증서 발급부터 네트워크 정책 적용, 장애 감지까지 하나의 시스템에서 처리할 수 있도록 설계했습니다.
-
----
-
-## 🎯 Problem
-
-- VPN 인증서 발급 및 재발급 수작업 처리
-- 레거시(UTM9)와 신규(SFOS) 장비 혼재
-- 방화벽/라우팅 정책 변경 누락 위험
-- 장애 발생 시 상태 추적 어려움
-- 운영 환경과 개발 환경 불일치
+이 저장소는 소스코드 저장소가 아니라, 프로젝트를 포트폴리오 관점에서 정리한 문서형 저장소입니다.  
+실제 운영 환경에서 해결했던 문제, 아키텍처 구성, 운영 자동화 전략, 장애 대응 사례를 중심으로 정리했습니다.
 
 ---
 
-## 💡 Solution
+## 프로젝트 한 줄 소개
 
-- VPN 인증서 발급 및 재발급 자동화
-- 장비 유형별 네트워크 정책 자동 처리
-- IP 임대 및 CCD 기반 클라이언트 관리
-- runtime guard 기반 상태 점검 및 자동 복구
-- Slack 기반 실시간 알림 시스템 구축
-- 운영 서버 기준 소스 동기화
+수작업 중심이던 SSL VPN 인증서 운영 절차를 인증서 발급, 장비 관리, 백업 검증, 보안 모니터링까지 포함한 웹 기반 운영 자동화 시스템으로 전환한 프로젝트입니다.
 
 ---
 
-## 🏗️ Architecture
-추가 예정
+## 핵심 요약
+
+- 일반 SG / Legacy SG / SFOS 장비가 혼재된 환경에서 VPN 운영 정책을 표준화
+- FastAPI + PostgreSQL + React 기반 운영 포털 구축
+- OpenVPN, CCD, 라우팅, NAT, firewalld 정책을 운영 흐름과 연계해 자동화
+- 보안 모니터, 슬랙 알림, 백업/복구 검증, runtime guard를 통해 운영 안정성 강화
+- 운영 서버와 로컬/검증 환경의 기준선을 맞춰 유지보수성을 높임
 
 ---
 
-## ⚙️ Tech Stack
+## 문서 구성
+
+### 1. 프로젝트 개요
+- [프로젝트 개요](./docs/01_project_overview.md)
+
+### 2. 아키텍처
+- [아키텍처 설명](./docs/02_architecture.md)
+- [draw.io 인프라 구성도](./diagrams/ssl_vpn_system_architecture.drawio)
+
+### 3. 주요 기능
+- [주요 기능 정리](./docs/03_key_features.md)
+
+### 4. 트러블슈팅 및 운영 경험
+- [트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
+
+---
+
+## 담당 역할
+
+- FastAPI 기반 백엔드 API 설계 및 구현
+- React 기반 운영 포털 UI 설계 및 개발
+- OpenVPN 운영 구조 및 CCD/IP 임대 관리 로직 개선
+- 설치 스크립트, runtime guard, 운영 자동화 스크립트 정비
+- 보안 모니터링, 슬랙 알림, 백업/복구 검증 흐름 구현
+- 운영 서버와 로컬/검증본 간 정합성 관리
+
+---
+
+## 기술 스택
 
 ### Backend
-- Python (FastAPI)
+- Python
+- FastAPI
+- SQLAlchemy
 - Uvicorn
 
 ### Frontend
 - React
+- Vite
 
 ### Database
 - PostgreSQL
 
 ### Network / Infra
-- OpenVPN (CCD, TLS, PKI)
-- iptables / firewalld / NAT / Routing
+- OpenVPN
+- firewalld
+- iptables
+- NAT / Routing
+- systemd
+- nginx
+- Azure VM / VNet / NSG
 
-### Monitoring
+### Monitoring / Alerting
+- Slack Bot / Webhook
 - WhatsUp Gold
-- Slack Webhook / Bot
-
-### Automation
-- Bash Script
 - Runtime Guard
 
-### Cloud
-- Azure (VNet, NSG, VPN Gateway)
-- AWS (VPC, EC2, CloudFormation)
+---
+
+## 프로젝트에서 해결한 문제
+
+- VPN 인증서 발급/재발급이 수작업 중심으로 운영됨
+- 레거시 장비와 최신 장비가 혼재되어 포트, 상태 로그, CCD, 라우팅 정책이 복잡함
+- 방화벽/라우팅/NAT 변경 누락 시 장애가 발생하기 쉬움
+- 서비스 다운, 인증서 만료, 침입 시도, 백업 실패에 대한 운영 가시성이 부족함
+- 재부팅 이후 서비스/인터페이스/방화벽 규칙이 틀어질 수 있어 운영 안정성이 낮음
 
 ---
 
-## 🔑 Key Features
+## 주요 성과
 
-### 🔐 VPN Certificate Automation
-- 인증서 발급/재발급 자동화
-- OpenVPN 기반 PKI 관리
-
-### 🌐 IP Allocation & CCD
-- 클라이언트별 IP 자동 할당
-- CCD 기반 정책 분리
-
-### ⚡ Network Policy Automation
-- 장비 유형별 포트/라우팅/NAT 자동 처리
-
-### 🛠 Runtime Guard
-- 서비스 상태 점검
-- 방화벽/라우팅 자동 복구
-
-### 📊 Monitoring & Alert
-- Slack 기반 실시간 알림
-- 인증서 만료 / 장애 감지
+- 인증서 발급, APC 생성, IP 임대, 장비/라이선스 관리 기능을 운영 포털로 통합
+- 일반 SG / Legacy SG / SFOS 유형별 운영 정책을 분리하고 구조화
+- 백업 검증, 서비스 상태 확인, 슬랙 알림을 통해 운영 대응 속도 향상
+- runtime guard 기반 재부팅 후 자동 점검 체계 구축
+- 운영 반영본과 로컬/검증본을 동기화해 유지보수 기준선 정리
 
 ---
 
-## 🚨 Troubleshooting Case
+## 포트폴리오 관점 포인트
 
-### NAC 인증 장애 분석
+이 프로젝트는 단순한 관리자 페이지 개발이 아니라 아래 영역을 함께 다룬 사례로 설명할 수 있습니다.
 
-#### Issue
-- NAC 인증이 정상적으로 동작하지 않는 문제 발생
-
-#### Analysis
-- Wireshark 기반 패킷 캡처
-- 방화벽 로그와 비교 분석
-
-#### Root Cause
-- 특정 구간에서 인증 트래픽 누락
-
-#### Solution
-- 방화벽 정책 및 라우팅 수정
+- 웹 서비스 개발
+- 네트워크 운영 자동화
+- 보안 운영
+- 장애 대응 체계 설계
+- 운영 환경 표준화 및 유지보수성 개선
 
 ---
 
-## 📈 Result
+## 추천 읽는 순서
 
-- VPN 운영 절차 자동화
-- 장애 대응 속도 향상
-- 멀티 환경 통합 관리 가능
-- 운영 일관성 확보
+1. [프로젝트 개요](./docs/01_project_overview.md)
+2. [아키텍처 설명](./docs/02_architecture.md)
+3. [주요 기능 정리](./docs/03_key_features.md)
+4. [트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
 
----
-
-## 🔥 What I Learned
-
-- 네트워크 흐름 기반 문제 해결 능력
-- 멀티 환경(VPN/Firewall/Cloud) 통합 설계 경험
-- 운영 자동화의 중요성
-- 인프라를 코드화하는 접근 방식
-
----
-
-## 📌 Future Improvements
-
-- BGP 기반 확장 구조 적용
-- Kubernetes 기반 확장성 개선
-- Observability 강화 (Prometheus / Grafana)
