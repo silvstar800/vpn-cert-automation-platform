@@ -1,14 +1,87 @@
-﻿# SSL VPN 인증서 및 운영 자동화 플랫폼
+# SSL VPN 인증서 및 운영 자동화 플랫폼
 
 OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선스 관리, 백업 검증, 보안 모니터링을 통합한 운영 포털 프로젝트입니다.
 
-이 저장소는 실제 서비스 운영 저장소 전체를 그대로 옮긴 저장소가 아니라, 프로젝트를 포트폴리오 관점에서 설명하기 위해 문서, 구성도, 실제 코드 일부를 정리한 포트폴리오 저장소입니다.
+이 저장소는 실제 운영 저장소 전체를 그대로 복제한 레포지토리가 아니라, 프로젝트를 포트폴리오 관점에서 이해하기 쉽도록 문서, 구성도, 핵심 코드, mock 테스트 환경을 정리한 포트폴리오 저장소입니다.
+
+---
+
+## 한눈에 보기
+
+- **프로젝트 성격**: 내부 운영 포털 + VPN 운영 자동화 + 보안 모니터링
+- **핵심 기술**: `FastAPI`, `PostgreSQL`, `React`, `OpenVPN`, `nginx`, `Docker`
+- **해결한 문제**: 수작업 중심 인증서 운영, 장비 유형 혼재, 라우팅/NAT 정책 관리, 백업 검증, 장애 대응 가시성 부족
+- **포인트**: 단순 CRUD가 아니라 운영 리스크를 줄이는 관리 시스템이라는 점에 초점을 맞춘 프로젝트
 
 ---
 
 ## 프로젝트 한 줄 소개
 
 수작업 중심이던 SSL VPN 인증서 운영 절차를 인증서 발급, 장비 관리, 백업 검증, 보안 모니터링까지 포함한 웹 기반 운영 자동화 시스템으로 전환한 프로젝트입니다.
+
+---
+
+## 주요 화면 미리보기
+
+아래 영역은 실제 mock 테스트 화면 캡처를 넣기 위한 섹션입니다.  
+스크린샷을 추가하면 GitHub 첫 화면에서 프로젝트 성격을 더 빠르게 전달할 수 있습니다.
+
+### 추천 캡처 구성
+
+1. 대시보드
+2. 클라이언트 목록
+3. 장비 / 라이선스
+4. 보안 모니터
+5. 백업 / 복구
+
+### 캡처 파일 예시 경로
+
+- `./images/dashboard.png`
+- `./images/clients.png`
+- `./images/assets.png`
+- `./images/security-monitor.png`
+- `./images/backup.png`
+
+### 삽입용 템플릿
+
+```md
+![대시보드](./images/dashboard.png)
+![클라이언트 목록](./images/clients.png)
+![장비/라이선스](./images/assets.png)
+![보안 모니터](./images/security-monitor.png)
+![백업](./images/backup.png)
+```
+
+---
+
+## 빠른 실행
+
+실제 운영 장비나 OpenVPN 환경 없이도 포트폴리오 화면과 API 흐름을 검증할 수 있도록 mock Docker 구성을 함께 정리했습니다.
+
+### 실행
+
+```bash
+docker compose --env-file ./code/frontend/docker-compose.mock.env -f ./code/frontend/docker-compose.mock.yml up --build
+```
+
+### 접속
+
+- 프론트: `http://localhost:8080`
+- 백엔드 Health: `http://localhost:8443/health`
+
+### 테스트 계정
+
+- 웹 로그인
+  - 아이디: `admin`
+  - 비밀번호: `admin123!`
+- 보안 모니터 / Debug Mode
+  - 비밀번호: `debug123!`
+
+### 종료
+
+```bash
+docker compose --env-file ./code/frontend/docker-compose.mock.env -f ./code/frontend/docker-compose.mock.yml down
+```
 
 ---
 
@@ -19,74 +92,6 @@ OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선
 - OpenVPN, CCD, 라우팅, NAT, firewalld 정책까지 운영 자동화 흐름에 포함
 - 보안 모니터, 슬랙 알림, 백업/복구 검증, runtime guard로 운영 안정성 강화
 - 실제 운영 서버와 동일한 기준선으로 기능과 코드를 추적할 수 있도록 정리
-
----
-
-## 문서 구성
-
-### 1. 프로젝트 개요
-- [프로젝트 개요](./docs/01_project_overview.md)
-
-### 2. 아키텍처
-- [아키텍처 설명](./docs/02_architecture.md)
-- [draw.io 구성도](./diagrams/ssl_vpn_system_architecture.drawio)
-
-### 3. 주요 기능
-- [주요 기능 정리](./docs/03_key_features.md)
-
-### 4. 트러블슈팅 및 운영 경험
-- [트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
-
-### 5. 실제 코드 참고
-- [코드 안내](./code/README.md)
-- [백엔드 코드](./code/backend)
-- [프론트엔드 코드](./code/frontend)
-
----
-
-## 실제 코드 바로 보기
-
-### 백엔드 핵심 진입점
-- [FastAPI 앱 진입점](./code/backend/app.py)
-- [DB 연결 구성](./code/backend/db.py)
-- [데이터 모델](./code/backend/models.py)
-- [도메인 매니저 계층](./code/backend/managers)
-- [Mock 데이터 시드 및 테스트 모드](./code/backend/mock_mode.py)
-- [백엔드 Dockerfile](./code/backend/Dockerfile.backend)
-
-### 프론트엔드 핵심 진입점
-- [앱 루트](./code/frontend/src/App.jsx)
-- [API 클라이언트](./code/frontend/src/api/client.js)
-- [대시보드 화면](./code/frontend/src/pages/DashboardPage.jsx)
-- [보안 모니터 화면](./code/frontend/src/pages/SecurityMonitorPage.jsx)
-- [전역 스타일](./code/frontend/src/styles/main.css)
-- [프론트 Dockerfile](./code/frontend/Dockerfile.frontend)
-- [Mock nginx 설정](./code/frontend/nginx.mock.conf)
-
----
-
-## Mock 테스트 환경
-
-실제 운영 장비나 OpenVPN 환경 없이도 포트폴리오 화면과 API 흐름을 빠르게 검증할 수 있도록 mock Docker 구성을 함께 정리했습니다.
-
-### 실행 파일
-
-- [docker-compose.mock.yml](./code/frontend/docker-compose.mock.yml)
-- [docker-compose.mock.env](./code/frontend/docker-compose.mock.env)
-- [mock_mode.py](./code/backend/mock_mode.py)
-
-### 테스트 접속 정보
-
-- 프론트: `http://localhost:8080`
-- 백엔드 Health: `http://localhost:8443/health`
-
-### 테스트 계정 / 비밀번호
-
-- 웹 로그인
-  - 아이디: `admin`
-  - 비밀번호: `admin123!`
-- 보안 모니터 / Debug Mode
-  - 비밀번호: `debug123!`
 
 ---
 
@@ -104,19 +109,23 @@ OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선
 ## 기술 스택
 
 ### Backend
+
 - Python
 - FastAPI
 - SQLAlchemy
 - Uvicorn
 
 ### Frontend
+
 - React
 - Vite
 
 ### Database
+
 - PostgreSQL
 
 ### Network / Infra
+
 - OpenVPN
 - firewalld
 - iptables
@@ -126,6 +135,7 @@ OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선
 - Azure VM / VNet / NSG
 
 ### Monitoring / Alerting
+
 - Slack Bot / Webhook
 - WhatsUp Gold
 - Runtime Guard
@@ -152,18 +162,72 @@ OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선
 
 ---
 
+## 문서 구성
+
+### 1. 프로젝트 개요
+
+- [프로젝트 개요](./docs/01_project_overview.md)
+
+### 2. 아키텍처
+
+- [아키텍처 설명](./docs/02_architecture.md)
+- [draw.io 구성도](./diagrams/ssl_vpn_system_architecture.drawio)
+
+### 3. 주요 기능
+
+- [주요 기능 정리](./docs/03_key_features.md)
+
+### 4. 트러블슈팅 및 운영 경험
+
+- [트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
+
+### 5. 실제 코드 참고
+
+- [코드 안내](./code/README.md)
+- [백엔드 코드](./code/backend)
+- [프론트엔드 코드](./code/frontend)
+
+---
+
+## 실제 코드 바로 보기
+
+### 백엔드 핵심 진입점
+
+- [FastAPI 앱 진입점](./code/backend/app.py)
+- [DB 연결 구성](./code/backend/db.py)
+- [데이터 모델](./code/backend/models.py)
+- [도메인 매니저 계층](./code/backend/managers)
+- [Mock 데이터 시드 및 테스트 모드](./code/backend/mock_mode.py)
+- [백엔드 Dockerfile](./code/backend/Dockerfile.backend)
+
+### 프론트엔드 핵심 진입점
+
+- [앱 루트](./code/frontend/src/App.jsx)
+- [API 클라이언트](./code/frontend/src/api/client.js)
+- [대시보드 화면](./code/frontend/src/pages/DashboardPage.jsx)
+- [보안 모니터 화면](./code/frontend/src/pages/SecurityMonitorPage.jsx)
+- [전역 스타일](./code/frontend/src/styles/main.css)
+- [프론트 Dockerfile](./code/frontend/Dockerfile.frontend)
+- [Mock nginx 설정](./code/frontend/nginx.mock.conf)
+
+---
+
 ## 폴더 설명
 
 ### `docs`
+
 프로젝트 설명 문서가 들어 있습니다. 프로젝트 배경, 아키텍처, 기능, 트러블슈팅을 문서 단위로 분리했습니다.
 
 ### `diagrams`
+
 아키텍처 구성도와 draw.io 원본 파일을 보관합니다.
 
 ### `images`
+
 운영 화면 캡처, 발표 자료용 PNG, 다이어그램 이미지 같은 정적 자료를 보관합니다.
 
 ### `code`
+
 포트폴리오 설명에 사용한 실제 백엔드/프론트엔드 코드 일부를 정리한 영역입니다.
 
 ---
