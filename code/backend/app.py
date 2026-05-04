@@ -37,8 +37,18 @@ from sqlalchemy.orm import Session
 
 import models
 from db import Base as DBBase, engine as DB_ENGINE, get_db
-from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, EquipmentAssetManager
+from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, RestoreExecutionError, EquipmentAssetManager
 from managers.security_manager import RateLimitExceeded
+from mock_mode import (
+    build_mock_backup_result,
+    build_mock_backup_status,
+    build_mock_health,
+    build_mock_restore_list,
+    build_mock_restore_result,
+    build_mock_slack_response,
+    build_mock_system_status,
+    seed_mock_environment,
+)
 
 app = FastAPI(
     title="SSLAuthenticator",
@@ -201,6 +211,8 @@ RESTORE_POINT_DIR = os.environ.get("RESTORE_POINT_DIR", "/opt/certsvc/restore_po
 APP_ENV_FILE = os.environ.get("APP_ENV_FILE", "/opt/certsvc/.env")
 APP_ROOT_DIR = Path("/opt/certsvc")
 APP_UI_DIR = APP_ROOT_DIR / "ui"
+MOCK_MODE = os.environ.get("MOCK_MODE", "0").strip() == "1"
+MOCK_DATA_DIR = Path(os.environ.get("MOCK_DATA_DIR", str(APP_ROOT_DIR / "mock_data")))
 BACKUP_CONFIG_SECRET = os.environ.get("BACKUP_CONFIG_SECRET", SECRET).strip()
 SLACK_ALERT_BRAND = os.environ.get("SLACK_ALERT_BRAND", "SSL 인증서 관리").strip() or "SSL 인증서 관리"
 WEB_LOGIN_USERNAME = os.environ.get("WEB_LOGIN_USERNAME", "admin").strip() or "admin"
@@ -233,11 +245,32 @@ VPN_CFG_MGR = VPNConfigManager(
     ccd_dir=CCD,
     ccd_legacy_dir=CCD_LEGACY,
     ccd_sfos_dir=CCD_SFOS,
-    openvpn_conf_path=OPENVPN_SERVER_CONF
+    openvpn_conf_path=OPENVPN_SERVER_CONF,
+    pki_dir=PKI,
+    templates_dir=os.environ.get("TEMPLATES_DIR", "/opt/certsvc/templates"),
+    openvpn_server_ip=OPENVPN_SERVER_IP,
+    openvpn_port=OPENVPN_PORT,
 )
 
 # Initialize BackupManager
-BACKUP_MGR = BackupManager(backup_base_dir=BACKUP_BASE_DIR)
+BACKUP_MGR = BackupManager(
+    backup_base_dir=BACKUP_BASE_DIR,
+    restore_stage_dir=RESTORE_STAGE_DIR,
+    restore_point_dir=RESTORE_POINT_DIR,
+    database_url=os.environ.get("DATABASE_URL", ""),
+    pki_dir=PKI,
+    ccd_dir=CCD,
+    ccd_legacy_dir=CCD_LEGACY,
+    ccd_sfos_dir=CCD_SFOS,
+    openvpn_server_conf=OPENVPN_SERVER_CONF,
+    app_env_file=APP_ENV_FILE,
+    app_root_dir=str(APP_ROOT_DIR),
+    app_ui_dir=str(APP_UI_DIR),
+    internal_api_base_url="http://127.0.0.1:8443",
+    internal_api_token=INTERNAL_API_TOKEN,
+    runtime_guard_log_file=RUNTIME_GUARD_LOG_FILE,
+    display_timezone=str(DISPLAY_TIMEZONE),
+)
 
 # Initialize AlertManager
 ALERT_MGR = AlertManager(
@@ -1557,17 +1590,7 @@ def append_backup_log(
 
 def build_local_backup_validation(bundle_dir: Path) -> dict:
     """Validate a locally created backup bundle and return a compact status payload."""
-    downloaded = sorted(path.name for path in bundle_dir.iterdir() if path.is_file())
-    validation = validate_downloaded_backup_bundle(bundle_dir, downloaded)
-    return {
-        "backupId": validation.get("backupId") or bundle_dir.name,
-        "valid": bool(validation.get("valid")),
-        "missingFiles": validation.get("missingFiles", []),
-        "validatedArchives": validation.get("validatedArchives", []),
-        "dbObjectCountHint": int(validation.get("dbObjectCountHint", 0) or 0),
-        "uiIncluded": bool((validation.get("manifest") or {}).get("uiIncluded") or "ui.tar.gz" in (validation.get("expectedFiles") or [])),
-        "checkedAt": now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
-    }
+    return BACKUP_MGR.build_local_backup_validation(bundle_dir)
 
 
 def summarize_backup_status(record: models.BackupSetting) -> dict:
@@ -1587,7 +1610,7 @@ def summarize_backup_status(record: models.BackupSetting) -> dict:
         latest_local["exists"] = True
         latest_local["backupId"] = latest_bundle.name
         try:
-            latest_local.update(build_local_backup_validation(latest_bundle))
+            latest_local.update(BACKUP_MGR.build_local_backup_validation(latest_bundle))
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, json.JSONDecodeError, tarfile.TarError) as exc:
             latest_local.update({
                 "valid": False,
@@ -1691,156 +1714,37 @@ def resolve_slack_token_payload(
 
 def ensure_ftp_remote_dir(ftp: FTP, remote_dir: str) -> str:
     """Ensure nested remote directories exist before file upload."""
-    normalized = "/" + "/".join(part for part in (remote_dir or "").split("/") if part)
-    if normalized == "/":
-        ftp.cwd("/")
-        return "/"
-    ftp.cwd("/")
-    for part in [segment for segment in normalized.split("/") if segment]:
-        try:
-            ftp.cwd(part)
-        except FTP_ERRORS:
-            try:
-                ftp.mkd(part)
-                ftp.cwd(part)
-            except FTP_ERRORS as exc:
-                raise RuntimeError(f"failed to ensure ftp directory segment: {part}") from exc
-    return ftp.pwd()
+    return BACKUP_MGR.ensure_ftp_remote_dir(ftp, remote_dir)
 
 
 def ftp_connect(host: str, username: str, password: str, timeout: int = 10) -> FTP:
     """Open and authenticate an FTP session."""
-    ftp = FTP()
-    ftp.connect(host=host, port=21, timeout=timeout)
-    ftp.login(user=username, passwd=password)
-    ftp.set_pasv(True)
-    return ftp
+    return BACKUP_MGR.ftp_connect(host, username, password, timeout=timeout)
 
 
 def upload_dir_via_ftp(ftp: FTP, local_dir: Path, remote_dir: str) -> list[str]:
     """Upload a local directory tree to an FTP directory."""
-    uploaded = []
-    local_dir = local_dir.resolve()
-    for path in sorted(local_dir.rglob("*")):
-        rel = path.relative_to(local_dir).as_posix()
-        target_parent = ensure_ftp_remote_dir(ftp, f"{remote_dir}/{Path(rel).parent.as_posix()}")
-        if path.is_dir():
-            continue
-        ftp.cwd(target_parent)
-        with open(path, "rb") as fh:
-            ftp.storbinary(f"STOR {Path(rel).name}", fh)
-        uploaded.append(rel)
-    return uploaded
+    return BACKUP_MGR.upload_dir_via_ftp(ftp, local_dir, remote_dir)
 
 
 def build_backup_manifest(record: models.BackupSetting, backup_id: str, files: list[str]) -> dict:
     """Build manifest metadata for a backup set."""
-    return {
-        "backupId": backup_id,
-        "createdAt": datetime.now(tz=timezone.utc).isoformat(),
-        "hostname": os.uname().nodename if hasattr(os, "uname") else os.environ.get("COMPUTERNAME", "unknown"),
-        "scheduleType": record.schedule_type or "manual",
-        "scheduleTime": record.schedule_time or "",
-        "scheduleWeekday": record.schedule_weekday,
-        "scheduleMonthday": record.schedule_monthday,
-        "ftpHost": record.ftp_host or "",
-        "ftpRemotePath": record.ftp_remote_path or "",
-        "uiIncluded": "ui.tar.gz" in files,
-        "files": files,
-    }
+    return BACKUP_MGR.build_backup_manifest(record, backup_id, files)
 
 
 def build_pg_dump_command(database_url: str, output_path: Path) -> tuple[list[str], dict[str, str]]:
     """Convert SQLAlchemy DATABASE_URL into pg_dump CLI arguments."""
-    parsed = make_url(database_url)
-    if not parsed.drivername.startswith("postgresql"):
-        raise RuntimeError("DATABASE_URL must use a PostgreSQL scheme")
-
-    database = parsed.database or ""
-    username = parsed.username or ""
-    if not database or not username:
-        raise RuntimeError("DATABASE_URL must include username and database name")
-
-    command = [
-        "pg_dump",
-        "--format=custom",
-        "--file",
-        str(output_path),
-        "-h",
-        parsed.host or "127.0.0.1",
-        "-p",
-        str(parsed.port or 5432),
-        "-U",
-        username,
-        "-d",
-        database,
-    ]
-    env = os.environ.copy()
-    env["PGPASSWORD"] = parsed.password or ""
-    return command, env
+    return BACKUP_MGR.build_pg_dump_command(output_path)
 
 
 def build_pg_restore_command(database_url: str, input_path: Path) -> tuple[list[str], dict[str, str]]:
     """Convert SQLAlchemy DATABASE_URL into pg_restore CLI arguments."""
-    parsed = make_url(database_url)
-    if not parsed.drivername.startswith("postgresql"):
-        raise RuntimeError("DATABASE_URL must use a PostgreSQL scheme")
-
-    database = parsed.database or ""
-    username = parsed.username or ""
-    if not database or not username:
-        raise RuntimeError("DATABASE_URL must include username and database name")
-
-    command = [
-        "pg_restore",
-        "--clean",
-        "--if-exists",
-        "--no-owner",
-        "--no-privileges",
-        "-h",
-        parsed.host or "127.0.0.1",
-        "-p",
-        str(parsed.port or 5432),
-        "-U",
-        username,
-        "-d",
-        database,
-        str(input_path),
-    ]
-    env = os.environ.copy()
-    env["PGPASSWORD"] = parsed.password or ""
-    return command, env
+    return BACKUP_MGR.build_pg_restore_command(input_path)
 
 
 def list_ftp_backup_directories(ftp: FTP, remote_root: str) -> list[str]:
     """Return backup bundle directory names from an FTP remote path."""
-    resolved = ensure_ftp_remote_dir(ftp, remote_root)
-    directories = []
-    try:
-        entries = list(ftp.mlsd(resolved))
-        for name, facts in entries:
-            if name in {".", ".."}:
-                continue
-            if facts.get("type") == "dir" and name.startswith("backup_"):
-                directories.append(name)
-        return sorted(directories, reverse=True)
-    except FTP_ERRORS:
-        current = ftp.pwd()
-        ftp.cwd(resolved)
-        try:
-            for entry in ftp.nlst():
-                name = Path(entry).name
-                if not name.startswith("backup_"):
-                    continue
-                try:
-                    ftp.cwd(name)
-                    directories.append(name)
-                    ftp.cwd(resolved)
-                except FTP_ERRORS:
-                    ftp.cwd(resolved)
-        finally:
-            ftp.cwd(current)
-    return sorted(set(directories), reverse=True)
+    return BACKUP_MGR.list_ftp_backup_directories(ftp, remote_root)
 
 
 def download_ftp_backup_bundle(
@@ -1850,650 +1754,119 @@ def download_ftp_backup_bundle(
     local_root: Path,
 ) -> tuple[Path, list[str]]:
     """Download one FTP backup bundle directory into local staging."""
-    resolved_root = ensure_ftp_remote_dir(ftp, remote_root)
-    remote_dir = f"{resolved_root.rstrip('/')}/{backup_id}"
-    stage_dir = local_root / f"{backup_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    stage_dir.mkdir(parents=True, exist_ok=True)
-
-    current = ftp.pwd()
-    downloaded = []
-    ftp.cwd(remote_dir)
-    try:
-        for entry in ftp.nlst():
-            name = Path(entry).name
-            if name in {".", ".."}:
-                continue
-            local_path = stage_dir / name
-            with open(local_path, "wb") as fh:
-                ftp.retrbinary(f"RETR {name}", fh.write)
-            downloaded.append(name)
-    finally:
-        ftp.cwd(current)
-    return stage_dir, sorted(downloaded)
+    return BACKUP_MGR.download_ftp_backup_bundle(ftp, remote_root, backup_id)
 
 
 def validate_tar_archive(path: Path) -> None:
     """Open a tar archive to verify it is readable."""
-    with tarfile.open(path, "r:gz") as tar:
-        tar.getmembers()
+    return BACKUP_MGR.validate_tar_archive(path)
 
 
 def archive_path_to_bundle(bundle_dir: Path, archive_name: str, source_path: Path, *, exclude_names: set[str] | None = None) -> Path:
     """Create a gzipped tar archive for a file or directory with optional exclusions."""
-    exclude_names = set(exclude_names or set())
-    archive_path = bundle_dir / archive_name
-    with tarfile.open(archive_path, "w:gz") as tar:
-        if source_path.is_dir():
-            tar.add(source_path, arcname=source_path.name, recursive=False)
-            root_parent = source_path.parent
-            for item in sorted(source_path.rglob("*")):
-                rel = item.relative_to(root_parent)
-                if any(part in exclude_names for part in rel.parts):
-                    continue
-                tar.add(item, arcname=str(rel), recursive=False)
-        else:
-            tar.add(source_path, arcname=source_path.name)
-    return archive_path
+    return BACKUP_MGR.archive_path_to_bundle(bundle_dir, archive_name, source_path, exclude_names=exclude_names)
 
 
 def validate_downloaded_backup_bundle(bundle_dir: Path, downloaded: list[str]) -> dict:
     """Validate manifest, dump, and archive files after download."""
-    checks = []
-
-    manifest_path = bundle_dir / "manifest.json"
-    checks.append({"name": "manifest.json 존재", "status": "success" if manifest_path.exists() else "failed", "detail": str(manifest_path)})
-    if not manifest_path.exists():
-        raise RuntimeError("manifest.json is missing")
-
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        checks.append({"name": "manifest.json 읽기", "status": "success", "detail": "manifest loaded"})
-    except json.JSONDecodeError as exc:
-        checks.append({"name": "manifest.json 읽기", "status": "failed", "detail": str(exc)})
-        raise RuntimeError(f"manifest.json parse failed: {exc}") from exc
-
-    expected_files = list(manifest.get("files", []))
-    missing_files = [name for name in expected_files if not (bundle_dir / name).exists()]
-    checks.append({
-        "name": "manifest 파일 검증",
-        "status": "success" if not missing_files else "failed",
-        "detail": f"expected={len(expected_files)}, missing={len(missing_files)}",
-    })
-
-    db_dump_path = bundle_dir / "db.dump"
-    checks.append({"name": "db.dump 존재", "status": "success" if db_dump_path.exists() else "failed", "detail": str(db_dump_path)})
-    if not db_dump_path.exists():
-        raise RuntimeError("db.dump is missing")
-
-    restore_list = subprocess.run(
-        ["pg_restore", "--list", str(db_dump_path)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    restore_lines = [line for line in restore_list.stdout.splitlines() if line.strip()]
-    checks.append({
-        "name": "DB 덤프 검증",
-        "status": "success",
-        "detail": f"pg_restore --list ok ({len(restore_lines)} lines)",
-    })
-
-    validated_archives = []
-    archive_checks = []
-    for archive_name in [
-        "pki.tar.gz",
-        "ccd.tar.gz",
-        "ccd_legacy.tar.gz",
-        "ccd_sfos.tar.gz",
-        "openvpn_conf.tar.gz",
-        "env.tar.gz",
-        "ui.tar.gz",
-    ]:
-        archive_path = bundle_dir / archive_name
-        if archive_path.exists():
-            validate_tar_archive(archive_path)
-            validated_archives.append(archive_name)
-            archive_checks.append({"name": archive_name, "status": "success", "detail": "archive ok"})
-        else:
-            archive_checks.append({"name": archive_name, "status": "skipped", "detail": "not present"})
-
-    checks.extend(archive_checks)
-
-    return {
-        "backupId": manifest.get("backupId") or bundle_dir.name,
-        "stagingDir": str(bundle_dir),
-        "downloadedFiles": downloaded,
-        "expectedFiles": expected_files,
-        "missingFiles": missing_files,
-        "validatedArchives": validated_archives,
-        "manifest": manifest,
-        "valid": not missing_files,
-        "checks": checks,
-        "dbObjectCountHint": len(restore_lines),
-    }
+    return BACKUP_MGR.validate_downloaded_backup_bundle(bundle_dir, downloaded)
 
 
 def create_restore_point_bundle() -> Path:
     """Create a local pre-restore snapshot before applying a bundle."""
-    restore_point_root = Path(RESTORE_POINT_DIR)
-    restore_point_root.mkdir(parents=True, exist_ok=True)
-    bundle_dir = restore_point_root / datetime.now().strftime("pre_restore_%Y%m%d_%H%M%S")
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-
-    db_dump_path = bundle_dir / "db.dump"
-    dump_command, dump_env = build_pg_dump_command(os.environ["DATABASE_URL"], db_dump_path)
-    subprocess.run(dump_command, check=True, capture_output=True, text=True, env=dump_env)
-
-    archive_targets = [
-        ("pki.tar.gz", Path(PKI), set()),
-        ("ccd.tar.gz", Path(CCD), set()),
-        ("ccd_legacy.tar.gz", Path(CCD_LEGACY), set()),
-        ("ccd_sfos.tar.gz", Path(CCD_SFOS), set()),
-        ("openvpn_conf.tar.gz", Path(OPENVPN_SERVER_CONF).parent, set()),
-        ("env.tar.gz", Path(APP_ENV_FILE), set()),
-        ("ui.tar.gz", APP_UI_DIR, {"node_modules", "release_snapshots", "dist.bak", "dist.pre_rollback", "dist.bad_rollback", "dist.current_wrong", "__pycache__"}),
-    ]
-
-    for archive_name, source_path, exclude_names in archive_targets:
-        if not source_path.exists():
-            continue
-        archive_path_to_bundle(bundle_dir, archive_name, source_path, exclude_names=exclude_names)
-    return bundle_dir
+    return BACKUP_MGR.create_restore_point_bundle()
 
 
 def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
     """Extract a tar.gz archive after checking for path traversal."""
-    target_dir.mkdir(parents=True, exist_ok=True)
-    resolved_target = target_dir.resolve()
-    with tarfile.open(archive_path, "r:gz") as tar:
-        for member in tar.getmembers():
-            member_path = (resolved_target / member.name).resolve()
-            # is_relative_to 사용: startswith 문자열 비교는 /opt/restore_extra 같은 경로를 통과시킬 수 있음
-            if not member_path.is_relative_to(resolved_target):
-                raise RuntimeError(f"unsafe archive member detected: {member.name}")
-        tar.extractall(path=str(target_dir))
-
-
-class RestoreExecutionError(RuntimeError):
-    """Raised when restore execution fails after partial stage progress."""
-
-    def __init__(self, message: str, payload: dict | None = None):
-        super().__init__(message)
-        self.payload = payload or {}
+    return BACKUP_MGR.safe_extract_archive(archive_path, target_dir)
 
 
 def append_restore_stage(stages: list[dict], name: str, status: str, detail: str) -> dict:
     """Append a restore stage entry in a UI-friendly shape."""
-    entry = {"name": name, "status": status, "detail": detail}
-    stages.append(entry)
-    return entry
+    return BACKUP_MGR.append_restore_stage(stages, name, status, detail)
 
 
 def run_systemctl_action(service_name: str, action: str) -> tuple[bool, str]:
     """Run a systemctl action and return success + readable detail."""
-    result = subprocess.run(
-        ["systemctl", action, service_name],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    detail = (result.stderr or result.stdout or "").strip()
-    if not detail:
-        detail = f"systemctl {action} {service_name} -> rc={result.returncode}"
-    return result.returncode == 0, detail
+    return BACKUP_MGR.run_systemctl_action(service_name, action)
 
 
 def fetch_local_json(path: str, timeout: int = 3) -> dict | list:
     """Call a local API endpoint, using the internal token when available."""
-    req = urllib.request.Request(f"http://127.0.0.1:8443{path}")
-    if INTERNAL_API_TOKEN:
-        req.add_header("X-Internal-Token", INTERNAL_API_TOKEN)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    return BACKUP_MGR.fetch_local_json(path, timeout=timeout)
 
 
 def build_restore_service_checklist() -> list[dict]:
     """Check core services and API endpoints after restore."""
-    def active(service_name: str) -> bool:
-        result = subprocess.run(["systemctl", "is-active", service_name], check=False, capture_output=True, text=True)
-        return result.returncode == 0 and result.stdout.strip() == "active"
-
-    checklist = [
-        {"name": "postgresql.service", "ok": active("postgresql.service"), "detail": "PostgreSQL 데이터베이스 서비스 상태"},
-        {"name": "nginx.service", "ok": active("nginx.service"), "detail": "HTTPS 프록시 및 정적 UI 서비스 상태"},
-        {"name": "certsvc.service", "ok": active("certsvc.service"), "detail": "FastAPI 백엔드 서비스 상태"},
-        {"name": "openvpn-server@server.service", "ok": active("openvpn-server@server.service"), "detail": "일반 SG OpenVPN 서비스 상태"},
-        {"name": "openvpn-server@server-legacy.service", "ok": active("openvpn-server@server-legacy.service"), "detail": "레거시 SG OpenVPN 서비스 상태"},
-        {"name": "openvpn-server@server-sfos.service", "ok": active("openvpn-server@server-sfos.service"), "detail": "SFOS OpenVPN 서비스 상태"},
-        {"name": "PKI 디렉터리", "ok": Path(PKI).exists(), "detail": PKI},
-        {"name": "CCD 디렉터리", "ok": Path(CCD).exists(), "detail": CCD},
-        {"name": "CCD Legacy 디렉터리", "ok": Path(CCD_LEGACY).exists(), "detail": CCD_LEGACY},
-        {"name": "CCD SFOS 디렉터리", "ok": Path(CCD_SFOS).exists(), "detail": CCD_SFOS},
-        {"name": ".env 파일", "ok": Path(APP_ENV_FILE).exists(), "detail": APP_ENV_FILE},
-    ]
-
-    health_ok = False
-    health_detail = "certsvc health check unavailable"
-    for _ in range(5):
-        try:
-            body = fetch_local_json("/health")
-            if isinstance(body, dict):
-                health_ok = bool(body.get("database"))
-                health_detail = json.dumps(body, ensure_ascii=False)
-                break
-        except Exception as exc:
-            health_detail = str(exc)
-            threading.Event().wait(1)
-    checklist.append({"name": "certsvc /health", "ok": health_ok, "detail": health_detail})
-
-    for path, label in [
-        ("/clients", "클라이언트 목록 API"),
-        ("/leases", "IP 임대 목록 API"),
-    ]:
-        ok = False
-        detail = "endpoint unavailable"
-        for _ in range(5):
-            try:
-                body = fetch_local_json(path)
-                count = len(body) if isinstance(body, list) else (len(body.get("items", [])) if isinstance(body, dict) else 0)
-                ok = True
-                detail = f"{path} 응답 정상, 항목 수={count}"
-                break
-            except Exception as exc:
-                detail = str(exc)
-                threading.Event().wait(1)
-        checklist.append({"name": label, "ok": ok, "detail": detail})
-    return checklist
+    return BACKUP_MGR.build_restore_service_checklist()
 
 
 def build_restore_preflight_summary(bundle_dir: Path | None, validation: dict | None = None) -> dict:
     """Summarize whether the current host is ready for a restore operation."""
-    validation = validation or {}
-    stage_root = Path(RESTORE_STAGE_DIR)
-    stage_root.mkdir(parents=True, exist_ok=True)
-    usage = shutil.disk_usage(stage_root)
-    bundle_size_bytes = 0
-    if bundle_dir and bundle_dir.exists():
-        try:
-            bundle_size_bytes = sum(item.stat().st_size for item in bundle_dir.rglob("*") if item.is_file())
-        except OSError:
-            bundle_size_bytes = 0
-    required_free_bytes = max(bundle_size_bytes * 2, 512 * 1024 * 1024)
-    service_checklist = build_restore_service_checklist()
-    failed_checks = [item.get("name") for item in service_checklist if not item.get("ok")]
-    ready = bool(validation.get("valid", True)) and usage.free >= required_free_bytes and not failed_checks
-    return {
-        "ready": ready,
-        "checkedAt": now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
-        "stageDir": str(stage_root),
-        "bundleDir": str(bundle_dir) if bundle_dir else "",
-        "bundleSizeBytes": bundle_size_bytes,
-        "freeBytes": usage.free,
-        "requiredFreeBytes": required_free_bytes,
-        "serviceChecklistOk": not failed_checks,
-        "failedChecks": failed_checks,
-        "validationOk": bool(validation.get("valid", True)),
-        "missingFiles": validation.get("missingFiles", []),
-        "uiIncluded": bool(
-            validation.get("uiIncluded")
-            or (validation.get("manifest") or {}).get("uiIncluded")
-            or "ui.tar.gz" in (validation.get("expectedFiles") or [])
-        ),
-    }
+    return BACKUP_MGR.build_restore_preflight_summary(bundle_dir, validation)
 
 
 def apply_restored_backup_bundle(bundle_dir: Path) -> dict:
     """Apply a downloaded backup bundle to the current server."""
-    stages = []
-    restore_point = None
-
-    stopped_services = [
-        "nginx.service",
-        "certsvc.service",
-        "openvpn-server@server.service",
-        "openvpn-server@server-legacy.service",
-        "openvpn-server@server-sfos.service",
-    ]
-    restarted_services = []
-    try:
-        restore_point = create_restore_point_bundle()
-        append_restore_stage(stages, "복구 전 자동 백업 생성", "success", str(restore_point))
-
-        for service in stopped_services:
-            ok, detail = run_systemctl_action(service, "stop")
-            append_restore_stage(stages, f"{service} 중지", "success" if ok else "failed", detail)
-            if not ok:
-                raise RestoreExecutionError(
-                    f"{service} 중지 실패",
-                    {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
-                )
-
-        db_dump_path = bundle_dir / "db.dump"
-        restore_command, restore_env = build_pg_restore_command(os.environ["DATABASE_URL"], db_dump_path)
-        subprocess.run(restore_command, check=True, capture_output=True, text=True, env=restore_env)
-        append_restore_stage(stages, "DB 복구", "success", str(db_dump_path))
-
-        archive_map = [
-            ("pki.tar.gz", Path("/etc/openvpn")),
-            ("ccd.tar.gz", Path("/etc/openvpn")),
-            ("ccd_legacy.tar.gz", Path("/etc/openvpn")),
-            ("ccd_sfos.tar.gz", Path("/etc/openvpn")),
-            ("openvpn_conf.tar.gz", Path("/etc/openvpn")),
-            ("ui.tar.gz", APP_ROOT_DIR),
-        ]
-        for archive_name, target_dir in archive_map:
-            archive_path = bundle_dir / archive_name
-            if archive_path.exists():
-                safe_extract_archive(archive_path, target_dir)
-                append_restore_stage(stages, f"{archive_name} 적용", "success", f"{archive_path} -> {target_dir}")
-            else:
-                append_restore_stage(stages, f"{archive_name} 적용", "skipped", "백업본에 파일이 없어 건너뜀")
-
-        env_archive = bundle_dir / "env.tar.gz"
-        if env_archive.exists():
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_root = Path(tmpdir)
-                safe_extract_archive(env_archive, tmp_root)
-                extracted_env = tmp_root / ".env"
-                if extracted_env.exists():
-                    shutil.copy2(extracted_env, APP_ENV_FILE)
-                    append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "success", APP_ENV_FILE)
-                else:
-                    append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "failed", "env.tar.gz 내부에 .env 파일이 없습니다.")
-                    raise RestoreExecutionError(
-                        "env.tar.gz 내부에 .env 파일이 없습니다.",
-                        {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
-                    )
-        else:
-            append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "skipped", "백업본에 env.tar.gz가 없어 건너뜀")
-    except RestoreExecutionError:
-        raise
-    except Exception as exc:
-        append_restore_stage(stages, "복구 적용", "failed", f"{type(exc).__name__}: {exc}")
-        raise RestoreExecutionError(
-            f"복구 적용 중 실패: {type(exc).__name__}: {exc}",
-            {"restorePoint": str(restore_point) if restore_point else "", "stages": stages, "restartedServices": restarted_services},
-        ) from exc
-    finally:
-        for service in [
-            "openvpn-server@server.service",
-            "openvpn-server@server-legacy.service",
-            "openvpn-server@server-sfos.service",
-            "certsvc.service",
-            "nginx.service",
-        ]:
-            ok, detail = run_systemctl_action(service, "start")
-            append_restore_stage(stages, f"{service} 시작", "success" if ok else "failed", detail)
-            restarted_services.append(service)
-
-    service_checklist = build_restore_service_checklist()
-    return {
-        "restorePoint": str(restore_point) if restore_point else "",
-        "restartedServices": restarted_services,
-        "stages": stages,
-        "serviceChecklist": service_checklist,
-        "serviceChecklistOk": all(item.get("ok") for item in service_checklist),
-    }
+    return BACKUP_MGR.apply_restored_backup_bundle(bundle_dir)
 
 
 def run_restore_job(db: Session, data: RestoreRunPayload) -> dict:
     """Download a selected backup from FTP and validate or restore it."""
-    host = (data.ftpHost or "").strip()
-    username = (data.ftpUsername or "").strip()
-    password = (data.ftpPassword or "").strip()
-    remote_path = (data.ftpRemotePath or "").strip() or "/"
-    backup_id = (data.backupId or "").strip()
-    mode = (data.mode or "validate").strip().lower()
-    if mode not in {"validate", "restore"}:
-        raise HTTPException(status_code=400, detail="mode must be validate or restore")
-    if not host or not username or not password or not backup_id:
-        raise HTTPException(status_code=400, detail="ftp host, username, password, and backupId are required")
-
     record = get_backup_settings_record(db)
-    staging_root = Path(RESTORE_STAGE_DIR)
-    staging_root.mkdir(parents=True, exist_ok=True)
-
-    ftp = ftp_connect(host, username, password)
+    mode = (data.mode or "validate").strip().lower()
     try:
-        bundle_dir, downloaded = download_ftp_backup_bundle(ftp, remote_path, backup_id, staging_root)
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            ftp.close()
-
-    validation = validate_downloaded_backup_bundle(bundle_dir, downloaded)
-    preflight = build_restore_preflight_summary(bundle_dir, validation)
-    append_backup_log(
-        db,
-        record,
-        job_type="restore_preflight",
-        status="success" if preflight.get("ready") else "failed",
-        trigger="manual",
-        message="복구 사전 점검 완료" if preflight.get("ready") else "복구 사전 점검 실패",
-        detail=json.dumps(preflight, ensure_ascii=False, indent=2),
-    )
-    result = {"mode": mode, "validation": validation, "preflight": preflight}
-    if mode == "restore":
-        if not validation.get("valid"):
-            missing = validation.get("missingFiles", [])
-            raise HTTPException(
-                status_code=400,
-                detail=f"백업 검증 실패: 누락 파일 {missing} — 불완전한 백업은 복구할 수 없습니다.",
-            )
-        if not preflight.get("ready"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"복구 사전 점검 실패: {', '.join(preflight.get('failedChecks', [])) or 'free space or validation issue'}",
-            )
-        try:
-            result["restore"] = apply_restored_backup_bundle(bundle_dir)
-        except RestoreExecutionError as exc:
-            failed_result = {
-                "mode": mode,
-                "validation": validation,
-                "restore": exc.payload,
-            }
-            append_backup_log(
-                db,
-                record,
-                job_type="restore",
-                status="failed",
-                trigger="manual",
-                message="백업 복구 실패",
-                detail=json.dumps(failed_result, ensure_ascii=False, indent=2),
-            )
-            if record.slack_notify_backup_completed:
-                try_send_configured_slack_message(
-                    record,
-                    "restore_failed",
-                    {
-                        "backupId": validation.get("backupId") or backup_id,
-                        "modeLabel": "복구모드",
-                        "error": str(exc),
-                        "restorePoint": (exc.payload or {}).get("restorePoint", "-"),
-                        "failedStage": next(
-                            (
-                                stage.get("name")
-                                for stage in reversed((exc.payload or {}).get("stages", []))
-                                if stage.get("status") == "failed"
-                            ),
-                            "-",
-                        ),
-                    },
-                )
-            raise
-
-    append_backup_log(
-        db,
-        record,
-        job_type="restore_validate" if mode == "validate" else "restore",
-        status="success",
-        trigger="manual",
-        message="백업 검증 완료" if mode == "validate" else "백업 복구 완료",
-        detail=json.dumps(result, ensure_ascii=False, indent=2),
-    )
-    if record.slack_notify_backup_completed:
-        if mode == "validate":
-            try_send_configured_slack_message(
-                record,
-                "restore_validated",
-                {
-                    "backupId": validation.get("backupId") or backup_id,
-                    "dbObjectCountHint": validation.get("dbObjectCountHint", 0),
-                    "missingFileCount": len(validation.get("missingFiles", [])),
-                },
-            )
-        else:
-            restore_result = result.get("restore") or {}
-            try_send_configured_slack_message(
-                record,
-                "restore_completed",
-                {
-                    "backupId": validation.get("backupId") or backup_id,
-                    "restorePoint": restore_result.get("restorePoint", "-"),
-                    "stageCount": len(restore_result.get("stages", [])),
-                    "serviceChecklistOk": bool(restore_result.get("serviceChecklistOk")),
-                },
-            )
-
-    # 스테이징 디렉터리는 검증/복구 완료 후 정리
-    try:
-        shutil.rmtree(bundle_dir, ignore_errors=True)
-    except Exception:
-        pass
-
-    return result
+        return BACKUP_MGR.run_restore_job(
+            db,
+            host=(data.ftpHost or "").strip(),
+            username=(data.ftpUsername or "").strip(),
+            password=(data.ftpPassword or "").strip(),
+            remote_path=(data.ftpRemotePath or "").strip() or "/",
+            backup_id=(data.backupId or "").strip(),
+            mode=mode,
+            record=record,
+            append_log=append_backup_log,
+            send_slack_message=try_send_configured_slack_message,
+        )
+    except RestoreExecutionError:
+        raise
+    except RuntimeError as exc:
+        message = str(exc)
+        if message.startswith("mode must be"):
+            raise HTTPException(status_code=400, detail=message) from exc
+        if "required" in message or message.startswith("백업 검증 실패") or message.startswith("복구 사전 점검 실패"):
+            raise HTTPException(status_code=400, detail=message) from exc
+        raise
 
 
 def create_backup_bundle(record: models.BackupSetting) -> tuple[Path, dict]:
     """Create a local backup bundle directory with DB/config artifacts."""
-    backup_id = datetime.now().strftime("backup_%Y%m%d_%H%M%S")
-    root = Path(BACKUP_BASE_DIR)
-    root.mkdir(parents=True, exist_ok=True)
-    bundle_dir = root / backup_id
-    bundle_dir.mkdir(parents=True, exist_ok=True)
-
-    files = []
-    db_dump_path = bundle_dir / "db.dump"
-    dump_command, dump_env = build_pg_dump_command(os.environ["DATABASE_URL"], db_dump_path)
-    subprocess.run(dump_command, check=True, capture_output=True, text=True, env=dump_env)
-    files.append(db_dump_path.name)
-
-    archive_targets = [
-        ("pki.tar.gz", Path(PKI), set()),
-        ("ccd.tar.gz", Path(CCD), set()),
-        ("ccd_legacy.tar.gz", Path(CCD_LEGACY), set()),
-        ("ccd_sfos.tar.gz", Path(CCD_SFOS), set()),
-        ("openvpn_conf.tar.gz", Path(OPENVPN_SERVER_CONF).parent, set()),
-        ("env.tar.gz", Path(APP_ENV_FILE), set()),
-        ("ui.tar.gz", APP_UI_DIR, {"node_modules", "release_snapshots", "dist.bak", "dist.pre_rollback", "dist.bad_rollback", "dist.current_wrong", "__pycache__"}),
-    ]
-
-    for archive_name, source_path, exclude_names in archive_targets:
-        if not source_path.exists():
-            continue
-        final_path = archive_path_to_bundle(bundle_dir, archive_name, source_path, exclude_names=exclude_names)
-        files.append(final_path.name)
-
-    manifest = build_backup_manifest(record, backup_id, files)
-    manifest_path = bundle_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    files.append(manifest_path.name)
-    manifest["files"] = files
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    return bundle_dir, manifest
+    return BACKUP_MGR.create_backup_bundle(record)
 
 
 def run_backup_job(db: Session, record: models.BackupSetting, trigger: str = "manual") -> dict:
     """Create and upload a backup bundle using current persisted settings."""
-    host = (record.ftp_host or "").strip()
-    username = (record.ftp_username or "").strip()
-    remote_path = (record.ftp_remote_path or "").strip() or "/"
-    if not host or not username or not record.ftp_password_enc:
+    if not (record.ftp_host or "").strip() or not (record.ftp_username or "").strip() or not record.ftp_password_enc:
         raise HTTPException(status_code=400, detail="backup settings are incomplete")
-    password = decrypt_backup_secret(record.ftp_password_enc)
-    bundle_dir: Path | None = None
-    manifest: dict = {}
-    uploaded: list[str] = []
-    validation: dict = {}
-    try:
-        bundle_dir, manifest = create_backup_bundle(record)
-        validation = build_local_backup_validation(bundle_dir)
-        append_backup_log(
-            db,
-            record,
-            job_type="backup_verify",
-            status="success" if validation.get("valid") else "failed",
-            trigger=trigger,
-            message="백업 자동 검증 완료" if validation.get("valid") else "백업 자동 검증 실패",
-            detail=json.dumps(validation, ensure_ascii=False, indent=2),
-        )
-        if not validation.get("valid"):
-            raise RuntimeError(f"backup verification failed: {validation.get('missingFiles', [])}")
-
-        ftp = ftp_connect(host, username, password)
-        try:
-            remote_dir = f"{remote_path.rstrip('/')}/{bundle_dir.name}" if remote_path.strip() else f"/{bundle_dir.name}"
-            uploaded = upload_dir_via_ftp(ftp, bundle_dir, remote_dir)
-        finally:
-            try:
-                ftp.quit()
-            except FTP_ERRORS:
-                ftp.close()
-    except BACKUP_IO_ERROR_TYPES as exc:
-        append_backup_log(
-            db,
-            record,
-            job_type="backup",
-            status="failed",
-            trigger=trigger,
-            message="백업 실행 실패",
-            detail=f"{type(exc).__name__}: {exc}",
-        )
-        raise
-    finally:
-        # FTP 업로드 완료(성공/실패 무관)후 로컬 번들 정리: 최근 5개만 유지
-        try:
-            root = Path(BACKUP_BASE_DIR)
-            bundles = sorted(root.glob("backup_*"), key=lambda p: p.name, reverse=True)
-            for old_bundle in bundles[5:]:
-                shutil.rmtree(old_bundle, ignore_errors=True)
-        except OSError:
-            LOGGER.exception("failed to clean old backup bundles")
-
-    log_entry = append_backup_log(
+    return BACKUP_MGR.run_backup_job(
         db,
         record,
-        job_type="backup",
-        status="success",
+        decrypt_secret=decrypt_backup_secret,
+        append_log=append_backup_log,
+        send_slack_message=try_send_configured_slack_message,
         trigger=trigger,
-        message=f"백업 실행 완료 ({bundle_dir.name})",
-        detail=json.dumps({"backupId": bundle_dir.name, "uploaded": uploaded, "manifest": manifest, "validation": validation}, ensure_ascii=False, indent=2),
     )
-    if record.slack_notify_backup_completed:
-        try_send_configured_slack_message(record, "backup_completed")
-    return {"backupId": bundle_dir.name, "uploaded": uploaded, "manifest": manifest, "validation": validation, "log": log_entry}
 
 
 def run_backup_test_connection(settings: BackupSettingsPayload) -> dict:
     """Validate FTP connectivity with the current form values before saving."""
-    host = (settings.ftpHost or "").strip()
-    username = (settings.ftpUsername or "").strip()
-    password = (settings.ftpPassword or "").strip()
-    remote_path = (settings.ftpRemotePath or "").strip() or "/"
-    if not host or not username or not password:
-        raise HTTPException(status_code=400, detail="ftp host, username, and password are required")
-    ftp = ftp_connect(host, username, password)
-    try:
-        resolved = ensure_ftp_remote_dir(ftp, remote_path)
-        listing = ftp.nlst()[:10]
-    finally:
-        try:
-            ftp.quit()
-        except FTP_ERRORS:
-            ftp.close()
-    return {"ok": True, "remotePath": resolved, "sample": listing}
+    return BACKUP_MGR.run_backup_test_connection(
+        host=(settings.ftpHost or "").strip(),
+        username=(settings.ftpUsername or "").strip(),
+        password=(settings.ftpPassword or "").strip(),
+        remote_path=(settings.ftpRemotePath or "").strip() or "/",
+    )
 
 
 def build_schedule_run_key(record: models.BackupSetting, now_local: datetime) -> str:
@@ -3094,7 +2467,7 @@ def write_ccd_entry_and_route(
         assigned_ip=assigned_ip,
         gateway_ip=route_gateway_ip,
         ccd_dir=ccd_dir,
-        push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1
+        push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
     )
 
 
@@ -3163,50 +2536,15 @@ def ensure_client_material(hostname: str):
     return ca_pem, crt_pem, key_pem
 
 
-def write_openvpn_bundle(hostname: str, ca_cert: str, certificate: str, key: str, vpn_port: int | None = None) -> str:
+def write_openvpn_bundle(hostname: str, ca_cert: str, certificate: str, key: str, vpn_port: int | None = None) -> tuple[str, Path]:
     """Build and archive deployable OpenVPN client bundle."""
-    client_conf = (
-        "client\n"
-        "dev tun-utm9\n"
-        "proto udp\n"
-        f"remote {OPENVPN_SERVER_IP} {int(vpn_port or OPENVPN_PORT)}\n\n"
-        "persist-key\n"
-        "persist-tun\n\n"
-        "cipher AES-256-CBC\n"
-        "auth SHA256\n\n"
-        "remote-cert-tls server\n\n"
-        "ca /etc/openvpn/certs/ca.crt\n"
-        f"cert /etc/openvpn/certs/{hostname}.crt\n"
-        f"key /etc/openvpn/certs/{hostname}.key\n"
-        "tls-auth /etc/openvpn/ta.key 1\n\n"
-        "key-direction 1\n"
-        "verb 3\n"
+    return VPN_CFG_MGR.write_openvpn_bundle(
+        hostname=hostname,
+        ca_cert=ca_cert,
+        certificate=certificate,
+        key=key,
+        vpn_port=vpn_port,
     )
-
-    root_dir = Path(tempfile.mkdtemp(prefix="certsvc-enroll-"))
-    base_dir = root_dir / hostname
-    cert_dir = base_dir / "certs"
-    cert_dir.mkdir(parents=True, exist_ok=True)
-
-    (base_dir / "client.conf").write_text(client_conf, encoding="utf-8")
-    (cert_dir / "ca.crt").write_text(ca_cert, encoding="utf-8")
-    (cert_dir / f"{hostname}.crt").write_text(certificate, encoding="utf-8")
-    (cert_dir / f"{hostname}.key").write_text(key, encoding="utf-8")
-    shutil.copy(str(Path(PKI) / "ta.key"), str(cert_dir / "ta.key"))
-
-    if TEMPLATES_DIR.is_dir():
-        for src in TEMPLATES_DIR.iterdir():
-            if src.name == "vpn_enroll.sh":
-                continue
-            dest = base_dir / src.name
-            if src.is_file():
-                shutil.copy2(src, dest)
-            elif src.is_dir():
-                shutil.copytree(src, dest, dirs_exist_ok=True)
-
-    archive_path = shutil.make_archive(str(root_dir / hostname), "gztar", str(root_dir), hostname)
-    # root_dir도 함께 반환해 호출자가 FileResponse 전송 후 BackgroundTask로 정리하도록 한다.
-    return archive_path, root_dir
 
 
 def format_dt(value) -> str:
@@ -3254,51 +2592,21 @@ def get_certificate_expire_at(cert_cn: str, created_at=None) -> str:
 
 def read_openvpn_connected_cns(status_file: str) -> set[str]:
     """Parse connected CN set from OpenVPN status file."""
-    connected: set[str] = set()
-    path = Path(status_file)
-    if not path.exists():
-        return connected
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if not line.startswith("CLIENT_LIST,"):
-                    continue
-                parts = line.strip().split(",")
-                if len(parts) >= 2 and parts[1]:
-                    connected.add(parts[1].strip())
-    except OSError:
-        return set()
-
-    return connected
+    return VPN_CFG_MGR.read_connected_common_names(status_file=status_file)
 
 
 def resolve_openvpn_status_file(config_path: str, fallback: str) -> str:
     """Resolve status file path from conf, or fallback if unavailable."""
-    if os.environ.get("OPENVPN_STATUS_FILE") and config_path == OPENVPN_SERVER_CONF:
-        return os.environ["OPENVPN_STATUS_FILE"]
-    if os.environ.get("SFOS_STATUS_FILE") and config_path == SFOS_SERVER_CONF:
-        return os.environ["SFOS_STATUS_FILE"]
-
-    path = Path(config_path)
-    if not path.exists():
-        return fallback
-
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or line.startswith(";"):
-                    continue
-                if not line.startswith("status "):
-                    continue
-                parts = line.split(maxsplit=1)
-                if len(parts) == 2 and parts[1].strip():
-                    return parts[1].strip()
-    except OSError:
-        return fallback
-
-    return fallback
+    override_path = ""
+    if config_path == OPENVPN_SERVER_CONF:
+        override_path = os.environ.get("OPENVPN_STATUS_FILE", "")
+    elif config_path == SFOS_SERVER_CONF:
+        override_path = os.environ.get("SFOS_STATUS_FILE", "")
+    return VPN_CFG_MGR.resolve_status_file(
+        config_path=config_path,
+        fallback=fallback,
+        override_path=override_path,
+    )
 
 
 def is_systemd_service_active(service_name: str) -> bool:
@@ -3481,8 +2789,30 @@ def startup_runtime() -> None:
     ensure_equipment_schema()
     sync_legacy_client_flags()
     ensure_backup_schema()
-    ensure_backup_scheduler_started()
-    ensure_alert_monitor_started()
+    if MOCK_MODE:
+        with Session(DB_ENGINE) as db:
+            seed_mock_environment(
+                db=db,
+                encrypt_secret=encrypt_backup_secret,
+                backup_base_dir=BACKUP_BASE_DIR,
+                client_backup_base_dir=CLIENT_BACKUP_BASE_DIR,
+                pki_dir=PKI,
+                ccd_dir=CCD,
+                ccd_legacy_dir=CCD_LEGACY,
+                ccd_sfos_dir=CCD_SFOS,
+                openvpn_status_file=OPENVPN_STATUS_FILE,
+                openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
+                sfos_status_file=SFOS_STATUS_FILE,
+                openvpn_server_conf=OPENVPN_SERVER_CONF,
+                sfos_server_conf=SFOS_SERVER_CONF,
+                security_state_file=SECURITY_STATE_FILE,
+                runtime_guard_log_file=RUNTIME_GUARD_LOG_FILE,
+                feature_log_dir=str(CERTSVC_FEATURE_LOG_DIR),
+            )
+        LOGGER.info("mock mode enabled data_dir=%s", MOCK_DATA_DIR)
+    else:
+        ensure_backup_scheduler_started()
+        ensure_alert_monitor_started()
 
 
 @app.get("/health")
@@ -3502,6 +2832,14 @@ def health(db: Session = Depends(get_db)):
         "uiDist": ui_index_exists,
         "backupDir": Path(BACKUP_BASE_DIR).exists(),
     }
+    if MOCK_MODE:
+        if not ui_index_exists and APP_UI_DIR.exists():
+            dir_checks["uiDist"] = True
+        return build_mock_health(
+            db_ok=db_ok,
+            checks=dir_checks,
+            now_label=now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
+        )
     status = "ok" if db_ok and all(dir_checks.values()) else "degraded"
     return {
         "status": status,
@@ -3905,6 +3243,18 @@ def system_status(
     db: Session = Depends(get_db),
 ):
     """Return service statuses and host resource metrics."""
+    if MOCK_MODE:
+        return build_mock_system_status(
+            openvpn_port=OPENVPN_PORT,
+            legacy_port=OPENVPN_LEGACY_PORT,
+            sfos_port=SFOS_VPN_PORT,
+            dirs={
+                "pki": Path(PKI).exists(),
+                "ccd": Path(CCD).exists(),
+                "ccd_sfos": Path(CCD_SFOS).exists(),
+            },
+        )
+
     def service_active(service_name: str) -> bool:
         """Check whether a systemd service is active."""
         result = subprocess.run(
@@ -4039,6 +3389,11 @@ def get_backup_status(
 ):
     """Return latest backup integrity summary without changing the UI."""
     record = get_backup_settings_record(db)
+    if MOCK_MODE:
+        return build_mock_backup_status(
+            backup_base_dir=BACKUP_BASE_DIR,
+            now_label=now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
+        )
     return summarize_backup_status(record)
 
 
@@ -4063,7 +3418,15 @@ def test_backup_settings(
         passwordChanged=True,
     )
     try:
-        result = run_backup_test_connection(payload)
+        if MOCK_MODE:
+            result = {
+                "ok": True,
+                "remotePath": (payload.ftpRemotePath or "/").strip() or "/",
+                "sample": ["backup_20260504_090000"],
+                "mock": True,
+            }
+        else:
+            result = run_backup_test_connection(payload)
         append_backup_log(
             db,
             record,
@@ -4144,7 +3507,19 @@ def run_backup_now(
     record = get_backup_settings_record(db)
     with BACKUP_LOCK:
         try:
-            result = run_backup_job(db, record, trigger="manual")
+            if MOCK_MODE:
+                result = build_mock_backup_result(backup_base_dir=BACKUP_BASE_DIR)
+                append_backup_log(
+                    db,
+                    record,
+                    job_type="backup",
+                    status="success",
+                    trigger="manual",
+                    message=f"백업 실행 완료 ({result['backupId']})",
+                    detail=json.dumps(result, ensure_ascii=False, indent=2),
+                )
+            else:
+                result = run_backup_job(db, record, trigger="manual")
         except HTTPException:
             raise
         except Exception as exc:
@@ -4167,6 +3542,21 @@ def list_restore_backups(
     if not host or not username or not password:
         raise HTTPException(status_code=400, detail="ftp host, username, and password are required")
     try:
+        if MOCK_MODE:
+            result = build_mock_restore_list(
+                backup_base_dir=BACKUP_BASE_DIR,
+                remote_path=remote_path,
+            )
+            append_backup_log(
+                db,
+                record,
+                job_type="restore_list",
+                status="success",
+                trigger="manual",
+                message="복구 백업 목록 조회 완료",
+                detail=json.dumps(result, ensure_ascii=False, indent=2),
+            )
+            return result
         ftp = ftp_connect(host, username, password)
         try:
             resolved = ensure_ftp_remote_dir(ftp, remote_path)
@@ -4210,7 +3600,24 @@ def run_restore_now(
     """Download a selected backup bundle and validate or restore it."""
     with BACKUP_LOCK:
         try:
-            result = run_restore_job(db, data)
+            if MOCK_MODE:
+                result = build_mock_restore_result(
+                    backup_base_dir=BACKUP_BASE_DIR,
+                    backup_id=(data.backupId or "").strip(),
+                    mode=(data.mode or "validate").strip().lower(),
+                    now_label=now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
+                )
+                append_backup_log(
+                    db,
+                    get_backup_settings_record(db),
+                    job_type="restore_validate" if (data.mode or "validate").lower() == "validate" else "restore",
+                    status="success",
+                    trigger="manual",
+                    message="백업 검증 완료" if (data.mode or "validate").lower() == "validate" else "백업 복구 완료",
+                    detail=json.dumps(result, ensure_ascii=False, indent=2),
+                )
+            else:
+                result = run_restore_job(db, data)
         except HTTPException:
             raise
         except RestoreExecutionError as exc:
@@ -4404,8 +3811,15 @@ def send_slack_test_message(
     channel = (record.slack_channel or SECURITY_SLACK_DEFAULT_CHANNEL).strip() or SECURITY_SLACK_DEFAULT_CHANNEL
     bot_token = decrypt_backup_secret(record.slack_bot_token_enc)
     try:
-        text, blocks = build_slack_test_payload((data.templateType or "").strip())
-        response = send_slack_message(bot_token, channel, text, blocks)
+        if MOCK_MODE:
+            result = build_mock_slack_response(
+                channel=channel,
+                template_type=(data.templateType or "").strip(),
+            )
+            response = result["response"]
+        else:
+            text, blocks = build_slack_test_payload((data.templateType or "").strip())
+            response = send_slack_message(bot_token, channel, text, blocks)
         append_backup_log(
             db,
             record,

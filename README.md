@@ -51,6 +51,8 @@ OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선
 - [DB 연결 구성](./code/backend/db.py)
 - [데이터 모델](./code/backend/models.py)
 - [도메인 매니저 계층](./code/backend/managers)
+- [Mock 데이터 시드 및 테스트 모드](./code/backend/mock_mode.py)
+- [백엔드 Dockerfile](./code/backend/Dockerfile.backend)
 
 ### 프론트엔드 핵심 진입점
 - [앱 루트](./code/frontend/src/App.jsx)
@@ -58,6 +60,33 @@ OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선
 - [대시보드 화면](./code/frontend/src/pages/DashboardPage.jsx)
 - [보안 모니터 화면](./code/frontend/src/pages/SecurityMonitorPage.jsx)
 - [전역 스타일](./code/frontend/src/styles/main.css)
+- [프론트 Dockerfile](./code/frontend/Dockerfile.frontend)
+- [Mock nginx 설정](./code/frontend/nginx.mock.conf)
+
+---
+
+## Mock 테스트 환경
+
+실제 운영 장비나 OpenVPN 환경 없이도 포트폴리오 화면과 API 흐름을 빠르게 검증할 수 있도록 mock Docker 구성을 함께 정리했습니다.
+
+### 실행 파일
+
+- [docker-compose.mock.yml](./code/frontend/docker-compose.mock.yml)
+- [docker-compose.mock.env](./code/frontend/docker-compose.mock.env)
+- [mock_mode.py](./code/backend/mock_mode.py)
+
+### 테스트 접속 정보
+
+- 프론트: `http://localhost:8080`
+- 백엔드 Health: `http://localhost:8443/health`
+
+### 테스트 계정 / 비밀번호
+
+- 웹 로그인
+  - 아이디: `admin`
+  - 비밀번호: `admin123!`
+- 보안 모니터 / Debug Mode
+  - 비밀번호: `debug123!`
 
 ---
 

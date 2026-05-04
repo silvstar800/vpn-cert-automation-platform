@@ -8,6 +8,9 @@
 - `db.py`
 - `models.py`
 - `managers/`
+- `mock_mode.py`
+- `requirements.txt`
+- `Dockerfile.backend`
 
 ## 주요 역할
 
@@ -17,6 +20,7 @@
 - 장비 / 라이선스 관리 API
 - 백업 / 복구 검증 흐름
 - 보안 모니터 및 알림 처리
+- mock 데이터 시드 및 테스트 환경 분기
 
 ## 보면 좋은 순서
 
@@ -24,7 +28,9 @@
 2. [models.py](./models.py)
 3. [db.py](./db.py)
 4. [managers](./managers)
+5. [mock_mode.py](./mock_mode.py)
 
 ## 포트폴리오 관점 포인트
 
 - 단순 CRUD를 넘어서 인증서 운영, VPN 정책, 백업, 보안 모니터링까지 함께 다루는 운영형 API 구조를 확인할 수 있습니다.
+- 운영 코드와 별개로 mock Docker 테스트가 가능하도록 구성해 UI/백엔드 흐름을 재현할 수 있습니다.

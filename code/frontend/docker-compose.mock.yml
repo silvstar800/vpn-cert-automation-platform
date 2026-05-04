@@ -1,0 +1,79 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: certsvc-mock-postgres
+    environment:
+      POSTGRES_DB: certsvc
+      POSTGRES_USER: certsvc
+      POSTGRES_PASSWORD: certsvc
+    volumes:
+      - certsvc_mock_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U certsvc -d certsvc"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: certsvc-mock-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://certsvc:certsvc@postgres:5432/certsvc
+      ENROLL_SECRET: demo-enroll-secret
+      BACKUP_CONFIG_SECRET: demo-backup-secret
+      INTERNAL_API_TOKEN: demo-internal-token
+      DEBUG_MODE_PASSWORD: debug123!
+      WEB_LOGIN_USERNAME: admin
+      WEB_LOGIN_PASSWORD: admin123!
+      WEB_SESSION_SECRET: demo-web-session-secret
+      FRONTEND_ORIGINS: http://localhost:8080
+      DISPLAY_TIMEZONE: Asia/Seoul
+      MOCK_MODE: "1"
+      MOCK_DATA_DIR: /opt/certsvc/mock_data
+      PKI_DIR: /opt/certsvc/mock_data/pki
+      CCD_DIR: /opt/certsvc/mock_data/ccd
+      CCD_LEGACY_DIR: /opt/certsvc/mock_data/ccd-legacy
+      CCD_SFOS_DIR: /opt/certsvc/mock_data/ccd-sfos
+      OPENVPN_SERVER_CONF: /opt/certsvc/mock_data/server.conf
+      OPENVPN_LEGACY_SERVER_CONF: /opt/certsvc/mock_data/server-legacy.conf
+      SFOS_SERVER_CONF: /opt/certsvc/mock_data/server-sfos.conf
+      OPENVPN_STATUS_FILE: /opt/certsvc/mock_data/status-server.log
+      OPENVPN_LEGACY_STATUS_FILE: /opt/certsvc/mock_data/status-legacy.log
+      SFOS_STATUS_FILE: /opt/certsvc/mock_data/status-sfos.log
+      BACKUP_BASE_DIR: /opt/certsvc/mock_data/backups
+      CLIENT_BACKUP_BASE_DIR: /opt/certsvc/mock_data/client_backups
+      RESTORE_STAGE_DIR: /opt/certsvc/mock_data/restore_staging
+      RESTORE_POINT_DIR: /opt/certsvc/mock_data/restore_points
+      SECURITY_STATE_FILE: /opt/certsvc/mock_data/security_monitor.json
+      RUNTIME_GUARD_LOG_FILE: /opt/certsvc/mock_data/runtime_guard.log
+      CERTSVC_FEATURE_LOG_DIR: /opt/certsvc/mock_data/feature_logs
+      APP_ENV_FILE: /opt/certsvc/mock_data/.env
+      APP_UI_DIR: /opt/certsvc/ui
+    ports:
+      - "8443:8443"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8443/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: /api
+    container_name: certsvc-mock-frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+
+volumes:
+  certsvc_mock_pgdata:
