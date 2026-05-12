@@ -157,6 +157,31 @@ export async function getEquipmentAssets() {
   return response.json();
 }
 
+export async function createEquipmentAssetManual(payload) {
+  const response = await request("/equipment-assets/manual", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return response.json();
+}
+
+export async function importEquipmentAssetsExcel(file) {
+  const form = new FormData();
+  form.append("file", file);
+  const response = await request("/equipment-assets/import", {
+    method: "POST",
+    body: form,
+  });
+  return response.json();
+}
+
+export async function downloadEquipmentAssetsTemplate() {
+  return request("/equipment-assets/import/template", {
+    method: "GET",
+  });
+}
+
 export async function getLeases() {
   const response = await request("/leases");
   return response.json();

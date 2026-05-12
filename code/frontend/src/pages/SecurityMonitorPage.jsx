@@ -1243,10 +1243,12 @@ export default function SecurityMonitorPage({ clients = [] }) {
         <p className="muted-text">차단 또는 관찰 중인 IP를 선택한 뒤, 검토 메모와 함께 해제할 수 있습니다.</p>
         <div className="table-wrap"><table className="data-table"><thead><tr><th>IP</th><th>상태</th><th>현재 실패</th><th>누적 실패</th><th>최근 사유</th><th>최근 호스트</th><th>차단 시각</th></tr></thead><tbody>{rows.length === 0 ? <tr><td colSpan="7" className="muted-text">현재 검토 대상이 없습니다.</td></tr> : rows.map((row) => <tr key={row.ip} className={selectedIp === row.ip ? "selected-row" : ""} onClick={() => setSelectedIp(row.ip)}><td>{row.ip}</td><td>{row.status === "banned" ? "차단" : row.status === "released" ? "해제" : "관찰"}</td><td>{row.failureCount}</td><td>{row.cumulativeFailures}</td><td>{row.lastFailureReason || "-"}</td><td>{row.lastHostname || "-"}</td><td>{formatTs(row.bannedAt)}</td></tr>)}</tbody></table></div>
       </div>
-        <div className="panel">
-          <h3 className="panel-title">차단 해제</h3>
-          {!selectedRow ? <p className="muted-text">차단 해제할 IP를 목록에서 선택해 주세요.</p> : <><div className="detail-list"><div className="detail-row"><span>선택 IP</span><strong>{selectedRow.ip}</strong></div><div className="detail-row"><span>상태</span><strong>{selectedRow.status}</strong></div><div className="detail-row"><span>최근 실패</span><strong>{selectedRow.lastFailureReason || "-"}</strong></div><div className="detail-row"><span>최근 이벤트</span><strong>{formatTs(selectedRow.lastFailureTs)}</strong></div></div><div className="field-group"><label>해제 메모</label><textarea className="input" rows="3" value={releaseNote} onChange={(e) => setReleaseNote(e.target.value)} placeholder="수동 검토 결과를 적어 주세요" /></div><div className="button-group settings-actions"><button className="primary-btn" type="button" onClick={handleUnban}>선택 IP 해제</button></div></>}
-        </div>
+      <div className="panel">
+        <h3 className="panel-title">차단 해제</h3>
+        {!selectedRow ? <p className="muted-text">차단 해제할 IP를 목록에서 선택해 주세요.</p> : <><div className="detail-list"><div className="detail-row"><span>선택 IP</span><strong>{selectedRow.ip}</strong></div><div className="detail-row"><span>상태</span><strong>{selectedRow.status}</strong></div><div className="detail-row"><span>최근 실패</span><strong>{selectedRow.lastFailureReason || "-"}</strong></div><div className="detail-row"><span>최근 이벤트</span><strong>{formatTs(selectedRow.lastFailureTs)}</strong></div></div><div className="field-group"><label>해제 메모</label><textarea className="input" rows="3" value={releaseNote} onChange={(e) => setReleaseNote(e.target.value)} placeholder="수동 검토 결과를 적어 주세요" /></div><div className="button-group settings-actions"><button className="primary-btn" type="button" onClick={handleUnban}>선택 IP 해제</button></div></>}
+        <div className="section-divider" />
+        {renderUnenrollFormSection()}
+      </div>
     </div>
   );
 

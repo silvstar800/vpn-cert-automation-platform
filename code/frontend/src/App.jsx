@@ -327,6 +327,10 @@ export default function App() {
     }
   };
 
+  const handleAssetsChanged = useCallback(async () => {
+    await loadAll(false);
+  }, [loadAll]);
+
   const renderedPage = useMemo(() => {
     switch (activePage) {
       case "dashboard":
@@ -336,7 +340,7 @@ export default function App() {
       case "client-detail":
         return <ClientDetailPage client={selectedClient} />;
       case "assets":
-        return <AssetsPage assets={assets} />;
+        return <AssetsPage assets={assets} onAssetsChanged={handleAssetsChanged} />;
       case "expire":
         return <ExpirePage clients={clients} />;
       case "iplease":
@@ -356,7 +360,7 @@ export default function App() {
       default:
         return <DashboardPage clients={clients} services={services} />;
     }
-  }, [activePage, assets, clients, leases, refreshIntervalSec, resources, securityUnlockError, securityUnlocked, selectedClient, services]);
+  }, [activePage, assets, clients, handleAssetsChanged, leases, refreshIntervalSec, resources, securityUnlockError, securityUnlocked, selectedClient, services]);
 
   if (authLoading) {
     return <div className="app-loading">웹 콘솔 인증 상태를 확인하는 중입니다...</div>;

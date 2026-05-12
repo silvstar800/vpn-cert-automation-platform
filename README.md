@@ -1,62 +1,42 @@
-# SSL VPN 인증서 및 운영 자동화 플랫폼
+# SSL VPN Automation Platform Portfolio
 
-OpenVPN 기반 SSL VPN 인증서 발급, APC 생성, IP 임대, 장비/라이선스 관리, 백업 검증, 보안 모니터링을 통합한 운영 포털 프로젝트입니다.
+OpenVPN 기반 SSL VPN 인증서 운영, APC 생성, IP 임대, 장비/라이선스 관리, 백업/복구, 보안 모니터링을 하나의 운영 포털로 통합한 프로젝트를 포트폴리오 관점에서 정리한 저장소입니다.
 
-이 저장소는 실제 운영 저장소 전체를 그대로 복제한 레포지토리가 아니라, 프로젝트를 포트폴리오 관점에서 이해하기 쉽도록 문서, 구성도, 핵심 코드, mock 테스트 환경을 정리한 포트폴리오 저장소입니다.
+이 저장소는 실제 운영 저장소 전체를 그대로 복제한 레포가 아니라, **설계 설명 + 핵심 코드 증빙 + Docker mock 재현 환경**을 함께 보여주기 위한 포트폴리오용 스냅샷입니다.
 
 ---
 
 ## 한눈에 보기
 
-- **프로젝트 성격**: 내부 운영 포털 + VPN 운영 자동화 + 보안 모니터링
+- **프로젝트 성격**: 운영형 인프라/네트워크 자동화 플랫폼
 - **핵심 기술**: `FastAPI`, `PostgreSQL`, `React`, `OpenVPN`, `nginx`, `Docker`
-- **해결한 문제**: 수작업 중심 인증서 운영, 장비 유형 혼재, 라우팅/NAT 정책 관리, 백업 검증, 장애 대응 가시성 부족
-- **포인트**: 단순 CRUD가 아니라 운영 리스크를 줄이는 관리 시스템이라는 점에 초점을 맞춘 프로젝트
+- **운영 대상**: 일반 SG, Legacy SG, SFOS / XGS
+- **핵심 가치**: 수작업 기반 VPN 운영 절차 자동화, 운영 가시성 확보, 장애 대응 속도 향상
 
 ---
 
-## 프로젝트 한 줄 소개
+## 이 저장소에서 볼 수 있는 것
 
-수작업 중심이던 SSL VPN 인증서 운영 절차를 인증서 발급, 장비 관리, 백업 검증, 보안 모니터링까지 포함한 웹 기반 운영 자동화 시스템으로 전환한 프로젝트입니다.
+### 1. 설계 / 운영 설명
+- 프로젝트 개요
+- 아키텍처
+- 주요 기능
+- 트러블슈팅 사례
+- 실제 서비스 / 포트 / API / 동작 흐름
 
----
+### 2. 실제 코드 증빙
+- 백엔드 핵심 API 코드
+- 프론트엔드 운영 포털 코드
+- manager 계층 구조
+- mock 데이터 시드
 
-## 주요 화면 미리보기
-
-아래 영역은 실제 mock 테스트 화면 캡처를 넣기 위한 섹션입니다.  
-스크린샷을 추가하면 GitHub 첫 화면에서 프로젝트 성격을 더 빠르게 전달할 수 있습니다.
-
-### 추천 캡처 구성
-
-1. 대시보드
-2. 클라이언트 목록
-3. 장비 / 라이선스
-4. 보안 모니터
-5. 백업 / 복구
-
-### 캡처 파일 예시 경로
-
-- `./images/dashboard.png`
-- `./images/clients.png`
-- `./images/assets.png`
-- `./images/security-monitor.png`
-- `./images/backup.png`
-
-### 삽입용 템플릿
-
-```md
-![대시보드](./images/dashboard.png)
-![클라이언트 목록](./images/clients.png)
-![장비/라이선스](./images/assets.png)
-![보안 모니터](./images/security-monitor.png)
-![백업](./images/backup.png)
-```
+### 3. Docker mock 테스트 환경
+- 운영 장비 없이도 UI / API 흐름 재현 가능
+- 로그인, 보안 모니터, 자산/장비, 백업 화면 검증 가능
 
 ---
 
-## 빠른 실행
-
-실제 운영 장비나 OpenVPN 환경 없이도 포트폴리오 화면과 API 흐름을 검증할 수 있도록 mock Docker 구성을 함께 정리했습니다.
+## 빠르게 실행
 
 ### 실행
 
@@ -72,10 +52,10 @@ docker compose --env-file ./code/frontend/docker-compose.mock.env -f ./code/fron
 ### 테스트 계정
 
 - 웹 로그인
-  - 아이디: `admin`
-  - 비밀번호: `admin123!`
+  - ID: `admin`
+  - PW: `admin123!`
 - 보안 모니터 / Debug Mode
-  - 비밀번호: `debug123!`
+  - PW: `debug123!`
 
 ### 종료
 
@@ -85,169 +65,67 @@ docker compose --env-file ./code/frontend/docker-compose.mock.env -f ./code/fron
 
 ---
 
-## 핵심 요약
-
-- 일반 SG / Legacy SG / SFOS 장비가 혼재된 환경에서 VPN 운영 정책을 분리해 표준화
-- FastAPI + PostgreSQL + React 기반의 운영 포털 구축
-- OpenVPN, CCD, 라우팅, NAT, firewalld 정책까지 운영 자동화 흐름에 포함
-- 보안 모니터, 슬랙 알림, 백업/복구 검증, runtime guard로 운영 안정성 강화
-- 실제 운영 서버와 동일한 기준선으로 기능과 코드를 추적할 수 있도록 정리
-
----
-
-## 담당 역할
-
-- FastAPI 기반 백엔드 API 설계 및 구현
-- React 기반 운영 포털 UI 설계 및 개발
-- OpenVPN 운영 구조 및 CCD/IP 임대 관리 로직 개선
-- 설치 스크립트, runtime guard, 운영 자동화 스크립트 정비
-- 보안 모니터링, 슬랙 알림, 백업/복구 검증 흐름 구현
-- 운영 서버와 로컬/검증 환경 간 기준선 정리
-
----
-
-## 기술 스택
-
-### Backend
-
-- Python
-- FastAPI
-- SQLAlchemy
-- Uvicorn
-
-### Frontend
-
-- React
-- Vite
-
-### Database
-
-- PostgreSQL
-
-### Network / Infra
-
-- OpenVPN
-- firewalld
-- iptables
-- NAT / Routing
-- systemd
-- nginx
-- Azure VM / VNet / NSG
-
-### Monitoring / Alerting
-
-- Slack Bot / Webhook
-- WhatsUp Gold
-- Runtime Guard
-
----
-
-## 해결한 문제
-
-- VPN 인증서 발급과 재발급이 수작업 중심이라 운영 부담이 큼
-- 레거시 장비와 최신 장비가 혼재되어 포트, 상태 로그, CCD, 라우팅 정책이 복잡함
-- 방화벽 / 라우팅 / NAT 변경 누락 리스크가 존재함
-- 서비스 다운, 인증서 만료, 침입 시도, 백업 실패에 대한 운영 가시성이 부족함
-- 재부팅 이후 서비스 / 인터페이스 / 방화벽 규칙이 틀어질 수 있어 운영 안정성이 낮음
-
----
-
-## 주요 성과
-
-- 인증서 발급, APC 생성, IP 임대, 장비/라이선스 관리 기능을 운영 포털로 통합
-- 일반 SG / Legacy SG / SFOS 유형별 운영 정책을 분리하고 일관된 관리 기준 마련
-- 백업 검증, 서비스 상태 확인, 슬랙 알림을 통해 운영 대응 속도 향상
-- runtime guard 기반 재부팅 후 자동 점검 체계 구축
-- 운영 반영본 기준으로 기능과 코드의 추적이 쉬운 구조 정리
-
----
-
 ## 문서 구성
 
-### 1. 프로젝트 개요
+- [01. 프로젝트 개요](./docs/01_project_overview.md)
+- [02. 아키텍처 설명](./docs/02_architecture.md)
+- [03. 주요 기능 정리](./docs/03_key_features.md)
+- [04. 트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
+- [05. 서비스 / 포트 / API / 동작 흐름](./docs/05_service_runtime_flow.md)
 
-- [프로젝트 개요](./docs/01_project_overview.md)
-
-### 2. 아키텍처
-
-- [아키텍처 설명](./docs/02_architecture.md)
+아키텍처 원본:
 - [draw.io 구성도](./diagrams/ssl_vpn_system_architecture.drawio)
 
-### 3. 주요 기능
+---
 
-- [주요 기능 정리](./docs/03_key_features.md)
-
-### 4. 트러블슈팅 및 운영 경험
-
-- [트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
-
-### 5. 실제 코드 참고
+## 코드 구성
 
 - [코드 안내](./code/README.md)
 - [백엔드 코드](./code/backend)
 - [프론트엔드 코드](./code/frontend)
 
----
+### 백엔드 바로 보기
 
-## 실제 코드 바로 보기
+- [FastAPI 진입점](./code/backend/app.py)
+- [DB 연결](./code/backend/db.py)
+- [모델 정의](./code/backend/models.py)
+- [매니저 계층](./code/backend/managers)
+- [Mock 모드 시드](./code/backend/mock_mode.py)
 
-### 백엔드 핵심 진입점
-
-- [FastAPI 앱 진입점](./code/backend/app.py)
-- [DB 연결 구성](./code/backend/db.py)
-- [데이터 모델](./code/backend/models.py)
-- [도메인 매니저 계층](./code/backend/managers)
-- [Mock 데이터 시드 및 테스트 모드](./code/backend/mock_mode.py)
-- [백엔드 Dockerfile](./code/backend/Dockerfile.backend)
-
-### 프론트엔드 핵심 진입점
+### 프론트엔드 바로 보기
 
 - [앱 루트](./code/frontend/src/App.jsx)
 - [API 클라이언트](./code/frontend/src/api/client.js)
 - [대시보드 화면](./code/frontend/src/pages/DashboardPage.jsx)
 - [보안 모니터 화면](./code/frontend/src/pages/SecurityMonitorPage.jsx)
 - [전역 스타일](./code/frontend/src/styles/main.css)
-- [프론트 Dockerfile](./code/frontend/Dockerfile.frontend)
-- [Mock nginx 설정](./code/frontend/nginx.mock.conf)
 
 ---
 
-## 폴더 설명
+## 주요 화면 미리보기
 
-### `docs`
+아래 파일명을 기준으로 실제 운영 화면 또는 mock 테스트 화면 캡처를 추가할 수 있습니다.
 
-프로젝트 설명 문서가 들어 있습니다. 프로젝트 배경, 아키텍처, 기능, 트러블슈팅을 문서 단위로 분리했습니다.
+- `./images/dashboard.png`
+- `./images/clients.png`
+- `./images/assets.png`
+- `./images/security-monitor.png`
+- `./images/backup.png`
 
-### `diagrams`
+예시:
 
-아키텍처 구성도와 draw.io 원본 파일을 보관합니다.
-
-### `images`
-
-운영 화면 캡처, 발표 자료용 PNG, 다이어그램 이미지 같은 정적 자료를 보관합니다.
-
-### `code`
-
-포트폴리오 설명에 사용한 실제 백엔드/프론트엔드 코드 일부를 정리한 영역입니다.
-
----
-
-## 포트폴리오 관점 포인트
-
-이 프로젝트는 단순한 관리자 페이지 개발이 아니라 아래 역량을 함께 보여주는 사례로 정리했습니다.
-
-- 내부 운영 서비스 설계
-- 네트워크 및 VPN 운영 자동화
-- 보안 모니터링 및 운영 통제
-- 장애 대응 체계 설계
-- 운영 환경 기준선 관리 및 유지보수성 개선
+```md
+![대시보드](./images/dashboard.png)
+![클라이언트 목록](./images/clients.png)
+![장비/라이선스](./images/assets.png)
+![보안 모니터](./images/security-monitor.png)
+![백업](./images/backup.png)
+```
 
 ---
 
-## 추천 읽는 순서
+## 참고
 
-1. [프로젝트 개요](./docs/01_project_overview.md)
-2. [아키텍처 설명](./docs/02_architecture.md)
-3. [주요 기능 정리](./docs/03_key_features.md)
-4. [트러블슈팅 사례](./docs/04_troubleshooting_cases.md)
-5. [코드 안내](./code/README.md)
+- 이 저장소의 코드는 실제 운영 서버 기준 최신 구조를 반영한 포트폴리오용 코드 스냅샷입니다.
+- 인프라 민감정보, 실제 운영 환경 변수, 사설 자산 정보는 제외 또는 치환되어 있습니다.
+- 설계/운영 관점 설명은 Notion 포트폴리오에서, 구현 상세와 mock 테스트는 이 GitHub 저장소에서 확인하는 구조를 의도했습니다.

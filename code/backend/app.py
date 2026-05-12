@@ -3,6 +3,7 @@ import glob
 import hashlib
 import hmac
 import ipaddress
+import io
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from sqlalchemy import inspect, text
@@ -37,17 +38,13 @@ from sqlalchemy.orm import Session
 
 import models
 from db import Base as DBBase, engine as DB_ENGINE, get_db
-from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, RestoreExecutionError, EquipmentAssetManager
+from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, EquipmentAssetManager
 from managers.security_manager import RateLimitExceeded
-from mock_mode import (
-    build_mock_backup_result,
-    build_mock_backup_status,
-    build_mock_health,
-    build_mock_restore_list,
-    build_mock_restore_result,
-    build_mock_slack_response,
-    build_mock_system_status,
-    seed_mock_environment,
+from utils.cert_utils import get_certificate_expire_at as get_certificate_expire_at_util
+from utils.network_utils import canonical_ip as canonical_ip_util
+from utils.time_utils import (
+    format_display_datetime as format_display_datetime_util,
+    now_in_timezone as now_in_timezone_util,
 )
 
 app = FastAPI(
@@ -211,8 +208,6 @@ RESTORE_POINT_DIR = os.environ.get("RESTORE_POINT_DIR", "/opt/certsvc/restore_po
 APP_ENV_FILE = os.environ.get("APP_ENV_FILE", "/opt/certsvc/.env")
 APP_ROOT_DIR = Path("/opt/certsvc")
 APP_UI_DIR = APP_ROOT_DIR / "ui"
-MOCK_MODE = os.environ.get("MOCK_MODE", "0").strip() == "1"
-MOCK_DATA_DIR = Path(os.environ.get("MOCK_DATA_DIR", str(APP_ROOT_DIR / "mock_data")))
 BACKUP_CONFIG_SECRET = os.environ.get("BACKUP_CONFIG_SECRET", SECRET).strip()
 SLACK_ALERT_BRAND = os.environ.get("SLACK_ALERT_BRAND", "SSL 인증서 관리").strip() or "SSL 인증서 관리"
 WEB_LOGIN_USERNAME = os.environ.get("WEB_LOGIN_USERNAME", "admin").strip() or "admin"
@@ -245,32 +240,11 @@ VPN_CFG_MGR = VPNConfigManager(
     ccd_dir=CCD,
     ccd_legacy_dir=CCD_LEGACY,
     ccd_sfos_dir=CCD_SFOS,
-    openvpn_conf_path=OPENVPN_SERVER_CONF,
-    pki_dir=PKI,
-    templates_dir=os.environ.get("TEMPLATES_DIR", "/opt/certsvc/templates"),
-    openvpn_server_ip=OPENVPN_SERVER_IP,
-    openvpn_port=OPENVPN_PORT,
+    openvpn_conf_path=OPENVPN_SERVER_CONF
 )
 
 # Initialize BackupManager
-BACKUP_MGR = BackupManager(
-    backup_base_dir=BACKUP_BASE_DIR,
-    restore_stage_dir=RESTORE_STAGE_DIR,
-    restore_point_dir=RESTORE_POINT_DIR,
-    database_url=os.environ.get("DATABASE_URL", ""),
-    pki_dir=PKI,
-    ccd_dir=CCD,
-    ccd_legacy_dir=CCD_LEGACY,
-    ccd_sfos_dir=CCD_SFOS,
-    openvpn_server_conf=OPENVPN_SERVER_CONF,
-    app_env_file=APP_ENV_FILE,
-    app_root_dir=str(APP_ROOT_DIR),
-    app_ui_dir=str(APP_UI_DIR),
-    internal_api_base_url="http://127.0.0.1:8443",
-    internal_api_token=INTERNAL_API_TOKEN,
-    runtime_guard_log_file=RUNTIME_GUARD_LOG_FILE,
-    display_timezone=str(DISPLAY_TIMEZONE),
-)
+BACKUP_MGR = BackupManager(backup_base_dir=BACKUP_BASE_DIR)
 
 # Initialize AlertManager
 ALERT_MGR = AlertManager(
@@ -308,6 +282,7 @@ ASSET_HISTORY_IMPORT = 5
 ASSET_HISTORY_MANUAL = 6
 TEMPLATES_DIR = Path("/opt/certsvc/templates")
 VPN_ENROLL_TEMPLATE_PATH = TEMPLATES_DIR / "vpn_enroll.sh"
+EQUIPMENT_ASSETS_TEMPLATE_PATH = TEMPLATES_DIR / "equipment_assets_template.xlsx"
 
 # File-based template is loaded from /opt/certsvc/templates/vpn_enroll.sh at runtime.
 
@@ -470,6 +445,11 @@ class InventorySyncPayload(BaseModel):
 class InventorySyncTriggerPayload(BaseModel):
     serialNumber: str | None = Field(default="", max_length=64)
     hostname: str | None = Field(default="", max_length=128)
+
+
+class EquipmentAssetManualCreatePayload(BaseModel):
+    serialNumber: str = Field(min_length=1, max_length=64)
+    deviceModel: str = Field(min_length=1, max_length=128)
 
 
 def load_template_text(template_path: Path) -> str:
@@ -840,18 +820,6 @@ def parse_cidr_network(cidr: str) -> ipaddress.IPv4Network | ipaddress.IPv6Netwo
     return ipaddress.ip_network(cidr, strict=False)
 
 
-def canonical_ip(value: str) -> str:
-    """Normalize IP/INET text into bare IP string (strip /32 etc.)."""
-    text_value = str(value).strip()
-    try:
-        return str(ipaddress.ip_interface(text_value).ip)
-    except ValueError:
-        try:
-            return str(ipaddress.ip_address(text_value))
-        except ValueError:
-            raise ValueError(f"invalid IP address: {text_value!r}")
-
-
 def alloc_ip_openvpn(db: Session, *, is_legacy: bool = False, client_id: int | None = None) -> str:
     """Allocate SG(OpenVPN) lease IP for hostname."""
     cidr = OPENVPN_LEGACY_CIDR if is_legacy else OPENVPN_CIDR
@@ -1082,7 +1050,7 @@ def build_inventory_mock_response(payload: dict) -> dict:
 
 def now_kst() -> datetime:
     """Return the current display time in Asia/Seoul."""
-    return datetime.now(tz=DISPLAY_TIMEZONE)
+    return now_in_timezone_util(DISPLAY_TIMEZONE)
 
 
 def normalize_feature_log_name(feature: str) -> str:
@@ -1349,7 +1317,7 @@ def ensure_ip_lease_schema() -> None:
         for client in clients:
             lease = db.query(models.IPLease).filter_by(client_id=client.id).first()
             if lease and lease.assigned_ip:
-                client_lookup[canonical_ip(lease.assigned_ip)] = client
+                client_lookup[canonical_ip_util(lease.assigned_ip)] = client
 
         changed = False
         for lease in db.query(models.IPLease).all():
@@ -1357,7 +1325,7 @@ def ensure_ip_lease_schema() -> None:
             if getattr(lease, "client_id", None):
                 desired = client_by_id.get(lease.client_id)
             if desired is None and lease.assigned_ip:
-                desired = client_lookup.get(canonical_ip(lease.assigned_ip))
+                desired = client_lookup.get(canonical_ip_util(lease.assigned_ip))
             if desired is None:
                 continue
             if lease.client_id != desired.id:
@@ -1457,7 +1425,7 @@ def sync_ip_lease_binding(
     """Bind an ip_leases row back to its source client and keep it aligned."""
     if not client or not client.id or not assigned_ip:
         return
-    normalized_ip = canonical_ip(assigned_ip)
+    normalized_ip = canonical_ip_util(assigned_ip)
     lease = db.query(models.IPLease).filter_by(client_id=client.id).first()
     if lease is None:
         lease = db.query(models.IPLease).filter_by(assigned_ip=normalized_ip).first()
@@ -1475,7 +1443,7 @@ def sync_ip_lease_binding(
     if lease.client_id != client.id:
         lease.client_id = client.id
         changed = True
-    if canonical_ip(lease.assigned_ip) != normalized_ip:
+    if canonical_ip_util(lease.assigned_ip) != normalized_ip:
         lease.assigned_ip = normalized_ip
         changed = True
     if not lease.is_active:
@@ -1489,7 +1457,7 @@ def build_assigned_ip_map(db: Session) -> dict[int, str]:
     """Return assigned IPs keyed by client id."""
     rows = db.query(models.IPLease.client_id, models.IPLease.assigned_ip).all()
     return {
-        int(client_id): canonical_ip(assigned_ip)
+        int(client_id): canonical_ip_util(assigned_ip)
         for client_id, assigned_ip in rows
         if client_id is not None and assigned_ip
     }
@@ -1497,21 +1465,19 @@ def build_assigned_ip_map(db: Session) -> dict[int, str]:
 
 def resolve_openvpn_runtime(is_legacy: bool) -> dict[str, object]:
     """Return per-runtime OpenVPN paths and gateway settings."""
-    if is_legacy:
-        return {
-            "ccd_dir": CCD_LEGACY,
-            "route_gateway_ip": OPENVPN_LEGACY_TUN_SERIAL_IP,
-            "server_conf_path": OPENVPN_LEGACY_SERVER_CONF,
-            "vpn_port": OPENVPN_LEGACY_PORT,
-            "status_file": OPENVPN_LEGACY_STATUS_FILE,
-        }
-    return {
-        "ccd_dir": CCD,
-        "route_gateway_ip": OPENVPN_TUN_SERIAL_IP,
-        "server_conf_path": OPENVPN_SERVER_CONF,
-        "vpn_port": OPENVPN_PORT,
-        "status_file": OPENVPN_STATUS_FILE,
-    }
+    return VPN_CFG_MGR.resolve_openvpn_runtime(
+        is_legacy,
+        ccd_dir=CCD,
+        ccd_legacy_dir=CCD_LEGACY,
+        openvpn_tun_serial_ip=OPENVPN_TUN_SERIAL_IP,
+        openvpn_legacy_tun_serial_ip=OPENVPN_LEGACY_TUN_SERIAL_IP,
+        openvpn_server_conf=OPENVPN_SERVER_CONF,
+        openvpn_legacy_server_conf=OPENVPN_LEGACY_SERVER_CONF,
+        openvpn_port=OPENVPN_PORT,
+        openvpn_legacy_port=OPENVPN_LEGACY_PORT,
+        openvpn_status_file=OPENVPN_STATUS_FILE,
+        openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
+    )
 
 
 def get_backup_settings_record(db: Session) -> models.BackupSetting:
@@ -1590,7 +1556,17 @@ def append_backup_log(
 
 def build_local_backup_validation(bundle_dir: Path) -> dict:
     """Validate a locally created backup bundle and return a compact status payload."""
-    return BACKUP_MGR.build_local_backup_validation(bundle_dir)
+    downloaded = sorted(path.name for path in bundle_dir.iterdir() if path.is_file())
+    validation = validate_downloaded_backup_bundle(bundle_dir, downloaded)
+    return {
+        "backupId": validation.get("backupId") or bundle_dir.name,
+        "valid": bool(validation.get("valid")),
+        "missingFiles": validation.get("missingFiles", []),
+        "validatedArchives": validation.get("validatedArchives", []),
+        "dbObjectCountHint": int(validation.get("dbObjectCountHint", 0) or 0),
+        "uiIncluded": bool((validation.get("manifest") or {}).get("uiIncluded") or "ui.tar.gz" in (validation.get("expectedFiles") or [])),
+        "checkedAt": now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
+    }
 
 
 def summarize_backup_status(record: models.BackupSetting) -> dict:
@@ -1610,7 +1586,7 @@ def summarize_backup_status(record: models.BackupSetting) -> dict:
         latest_local["exists"] = True
         latest_local["backupId"] = latest_bundle.name
         try:
-            latest_local.update(BACKUP_MGR.build_local_backup_validation(latest_bundle))
+            latest_local.update(build_local_backup_validation(latest_bundle))
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, json.JSONDecodeError, tarfile.TarError) as exc:
             latest_local.update({
                 "valid": False,
@@ -1719,7 +1695,7 @@ def ensure_ftp_remote_dir(ftp: FTP, remote_dir: str) -> str:
 
 def ftp_connect(host: str, username: str, password: str, timeout: int = 10) -> FTP:
     """Open and authenticate an FTP session."""
-    return BACKUP_MGR.ftp_connect(host, username, password, timeout=timeout)
+    return BACKUP_MGR.ftp_connect(host, username, password, timeout)
 
 
 def upload_dir_via_ftp(ftp: FTP, local_dir: Path, remote_dir: str) -> list[str]:
@@ -1734,12 +1710,12 @@ def build_backup_manifest(record: models.BackupSetting, backup_id: str, files: l
 
 def build_pg_dump_command(database_url: str, output_path: Path) -> tuple[list[str], dict[str, str]]:
     """Convert SQLAlchemy DATABASE_URL into pg_dump CLI arguments."""
-    return BACKUP_MGR.build_pg_dump_command(output_path)
+    return BACKUP_MGR.build_pg_dump_command(database_url, output_path)
 
 
 def build_pg_restore_command(database_url: str, input_path: Path) -> tuple[list[str], dict[str, str]]:
     """Convert SQLAlchemy DATABASE_URL into pg_restore CLI arguments."""
-    return BACKUP_MGR.build_pg_restore_command(input_path)
+    return BACKUP_MGR.build_pg_restore_command(database_url, input_path)
 
 
 def list_ftp_backup_directories(ftp: FTP, remote_root: str) -> list[str]:
@@ -1754,12 +1730,12 @@ def download_ftp_backup_bundle(
     local_root: Path,
 ) -> tuple[Path, list[str]]:
     """Download one FTP backup bundle directory into local staging."""
-    return BACKUP_MGR.download_ftp_backup_bundle(ftp, remote_root, backup_id)
+    return BACKUP_MGR.download_ftp_backup_bundle(ftp, remote_root, backup_id, local_root)
 
 
 def validate_tar_archive(path: Path) -> None:
     """Open a tar archive to verify it is readable."""
-    return BACKUP_MGR.validate_tar_archive(path)
+    BACKUP_MGR.validate_tar_archive(path)
 
 
 def archive_path_to_bundle(bundle_dir: Path, archive_name: str, source_path: Path, *, exclude_names: set[str] | None = None) -> Path:
@@ -1774,12 +1750,30 @@ def validate_downloaded_backup_bundle(bundle_dir: Path, downloaded: list[str]) -
 
 def create_restore_point_bundle() -> Path:
     """Create a local pre-restore snapshot before applying a bundle."""
-    return BACKUP_MGR.create_restore_point_bundle()
+    return BACKUP_MGR.create_restore_point_bundle(
+        pki_dir=PKI,
+        ccd_dir=CCD,
+        ccd_legacy_dir=CCD_LEGACY,
+        ccd_sfos_dir=CCD_SFOS,
+        openvpn_conf_path=OPENVPN_SERVER_CONF,
+        app_env_file=APP_ENV_FILE,
+        app_ui_dir=str(APP_UI_DIR),
+        restore_point_dir=RESTORE_POINT_DIR,
+        database_url=os.environ["DATABASE_URL"],
+    )
 
 
 def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
     """Extract a tar.gz archive after checking for path traversal."""
-    return BACKUP_MGR.safe_extract_archive(archive_path, target_dir)
+    BACKUP_MGR.safe_extract_archive(archive_path, target_dir)
+
+
+class RestoreExecutionError(RuntimeError):
+    """Raised when restore execution fails after partial stage progress."""
+
+    def __init__(self, message: str, payload: dict | None = None):
+        super().__init__(message)
+        self.payload = payload or {}
 
 
 def append_restore_stage(stages: list[dict], name: str, status: str, detail: str) -> dict:
@@ -1794,79 +1788,431 @@ def run_systemctl_action(service_name: str, action: str) -> tuple[bool, str]:
 
 def fetch_local_json(path: str, timeout: int = 3) -> dict | list:
     """Call a local API endpoint, using the internal token when available."""
-    return BACKUP_MGR.fetch_local_json(path, timeout=timeout)
+    req = urllib.request.Request(f"http://127.0.0.1:8443{path}")
+    if INTERNAL_API_TOKEN:
+        req.add_header("X-Internal-Token", INTERNAL_API_TOKEN)
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def build_restore_service_checklist() -> list[dict]:
     """Check core services and API endpoints after restore."""
-    return BACKUP_MGR.build_restore_service_checklist()
+    def active(service_name: str) -> bool:
+        result = subprocess.run(["systemctl", "is-active", service_name], check=False, capture_output=True, text=True)
+        return result.returncode == 0 and result.stdout.strip() == "active"
+
+    checklist = [
+        {"name": "postgresql.service", "ok": active("postgresql.service"), "detail": "PostgreSQL 데이터베이스 서비스 상태"},
+        {"name": "nginx.service", "ok": active("nginx.service"), "detail": "HTTPS 프록시 및 정적 UI 서비스 상태"},
+        {"name": "certsvc.service", "ok": active("certsvc.service"), "detail": "FastAPI 백엔드 서비스 상태"},
+        {"name": "openvpn-server@server.service", "ok": active("openvpn-server@server.service"), "detail": "일반 SG OpenVPN 서비스 상태"},
+        {"name": "openvpn-server@server-legacy.service", "ok": active("openvpn-server@server-legacy.service"), "detail": "레거시 SG OpenVPN 서비스 상태"},
+        {"name": "openvpn-server@server-sfos.service", "ok": active("openvpn-server@server-sfos.service"), "detail": "SFOS OpenVPN 서비스 상태"},
+        {"name": "PKI 디렉터리", "ok": Path(PKI).exists(), "detail": PKI},
+        {"name": "CCD 디렉터리", "ok": Path(CCD).exists(), "detail": CCD},
+        {"name": "CCD Legacy 디렉터리", "ok": Path(CCD_LEGACY).exists(), "detail": CCD_LEGACY},
+        {"name": "CCD SFOS 디렉터리", "ok": Path(CCD_SFOS).exists(), "detail": CCD_SFOS},
+        {"name": ".env 파일", "ok": Path(APP_ENV_FILE).exists(), "detail": APP_ENV_FILE},
+    ]
+
+    health_ok = False
+    health_detail = "certsvc health check unavailable"
+    for _ in range(5):
+        try:
+            body = fetch_local_json("/health")
+            if isinstance(body, dict):
+                health_ok = bool(body.get("database"))
+                health_detail = json.dumps(body, ensure_ascii=False)
+                break
+        except Exception as exc:
+            health_detail = str(exc)
+            threading.Event().wait(1)
+    checklist.append({"name": "certsvc /health", "ok": health_ok, "detail": health_detail})
+
+    for path, label in [
+        ("/clients", "클라이언트 목록 API"),
+        ("/leases", "IP 임대 목록 API"),
+    ]:
+        ok = False
+        detail = "endpoint unavailable"
+        for _ in range(5):
+            try:
+                body = fetch_local_json(path)
+                count = len(body) if isinstance(body, list) else (len(body.get("items", [])) if isinstance(body, dict) else 0)
+                ok = True
+                detail = f"{path} 응답 정상, 항목 수={count}"
+                break
+            except Exception as exc:
+                detail = str(exc)
+                threading.Event().wait(1)
+        checklist.append({"name": label, "ok": ok, "detail": detail})
+    return checklist
 
 
 def build_restore_preflight_summary(bundle_dir: Path | None, validation: dict | None = None) -> dict:
     """Summarize whether the current host is ready for a restore operation."""
-    return BACKUP_MGR.build_restore_preflight_summary(bundle_dir, validation)
+    validation = validation or {}
+    stage_root = Path(RESTORE_STAGE_DIR)
+    stage_root.mkdir(parents=True, exist_ok=True)
+    usage = shutil.disk_usage(stage_root)
+    bundle_size_bytes = 0
+    if bundle_dir and bundle_dir.exists():
+        try:
+            bundle_size_bytes = sum(item.stat().st_size for item in bundle_dir.rglob("*") if item.is_file())
+        except OSError:
+            bundle_size_bytes = 0
+    required_free_bytes = max(bundle_size_bytes * 2, 512 * 1024 * 1024)
+    service_checklist = build_restore_service_checklist()
+    failed_checks = [item.get("name") for item in service_checklist if not item.get("ok")]
+    ready = bool(validation.get("valid", True)) and usage.free >= required_free_bytes and not failed_checks
+    return {
+        "ready": ready,
+        "checkedAt": now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
+        "stageDir": str(stage_root),
+        "bundleDir": str(bundle_dir) if bundle_dir else "",
+        "bundleSizeBytes": bundle_size_bytes,
+        "freeBytes": usage.free,
+        "requiredFreeBytes": required_free_bytes,
+        "serviceChecklistOk": not failed_checks,
+        "failedChecks": failed_checks,
+        "validationOk": bool(validation.get("valid", True)),
+        "missingFiles": validation.get("missingFiles", []),
+        "uiIncluded": bool(
+            validation.get("uiIncluded")
+            or (validation.get("manifest") or {}).get("uiIncluded")
+            or "ui.tar.gz" in (validation.get("expectedFiles") or [])
+        ),
+    }
 
 
 def apply_restored_backup_bundle(bundle_dir: Path) -> dict:
     """Apply a downloaded backup bundle to the current server."""
-    return BACKUP_MGR.apply_restored_backup_bundle(bundle_dir)
+    stages = []
+    restore_point = None
+
+    stopped_services = [
+        "nginx.service",
+        "certsvc.service",
+        "openvpn-server@server.service",
+        "openvpn-server@server-legacy.service",
+        "openvpn-server@server-sfos.service",
+    ]
+    restarted_services = []
+    try:
+        restore_point = create_restore_point_bundle()
+        append_restore_stage(stages, "복구 전 자동 백업 생성", "success", str(restore_point))
+
+        for service in stopped_services:
+            ok, detail = run_systemctl_action(service, "stop")
+            append_restore_stage(stages, f"{service} 중지", "success" if ok else "failed", detail)
+            if not ok:
+                raise RestoreExecutionError(
+                    f"{service} 중지 실패",
+                    {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
+                )
+
+        db_dump_path = bundle_dir / "db.dump"
+        restore_command, restore_env = build_pg_restore_command(os.environ["DATABASE_URL"], db_dump_path)
+        subprocess.run(restore_command, check=True, capture_output=True, text=True, env=restore_env)
+        append_restore_stage(stages, "DB 복구", "success", str(db_dump_path))
+
+        archive_map = [
+            ("pki.tar.gz", Path("/etc/openvpn")),
+            ("ccd.tar.gz", Path("/etc/openvpn")),
+            ("ccd_legacy.tar.gz", Path("/etc/openvpn")),
+            ("ccd_sfos.tar.gz", Path("/etc/openvpn")),
+            ("openvpn_conf.tar.gz", Path("/etc/openvpn")),
+            ("ui.tar.gz", APP_ROOT_DIR),
+        ]
+        for archive_name, target_dir in archive_map:
+            archive_path = bundle_dir / archive_name
+            if archive_path.exists():
+                safe_extract_archive(archive_path, target_dir)
+                append_restore_stage(stages, f"{archive_name} 적용", "success", f"{archive_path} -> {target_dir}")
+            else:
+                append_restore_stage(stages, f"{archive_name} 적용", "skipped", "백업본에 파일이 없어 건너뜀")
+
+        env_archive = bundle_dir / "env.tar.gz"
+        if env_archive.exists():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_root = Path(tmpdir)
+                safe_extract_archive(env_archive, tmp_root)
+                extracted_env = tmp_root / ".env"
+                if extracted_env.exists():
+                    shutil.copy2(extracted_env, APP_ENV_FILE)
+                    append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "success", APP_ENV_FILE)
+                else:
+                    append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "failed", "env.tar.gz 내부에 .env 파일이 없습니다.")
+                    raise RestoreExecutionError(
+                        "env.tar.gz 내부에 .env 파일이 없습니다.",
+                        {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
+                    )
+        else:
+            append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "skipped", "백업본에 env.tar.gz가 없어 건너뜀")
+    except RestoreExecutionError:
+        raise
+    except Exception as exc:
+        append_restore_stage(stages, "복구 적용", "failed", f"{type(exc).__name__}: {exc}")
+        raise RestoreExecutionError(
+            f"복구 적용 중 실패: {type(exc).__name__}: {exc}",
+            {"restorePoint": str(restore_point) if restore_point else "", "stages": stages, "restartedServices": restarted_services},
+        ) from exc
+    finally:
+        for service in [
+            "openvpn-server@server.service",
+            "openvpn-server@server-legacy.service",
+            "openvpn-server@server-sfos.service",
+            "certsvc.service",
+            "nginx.service",
+        ]:
+            ok, detail = run_systemctl_action(service, "start")
+            append_restore_stage(stages, f"{service} 시작", "success" if ok else "failed", detail)
+            restarted_services.append(service)
+
+    service_checklist = build_restore_service_checklist()
+    return {
+        "restorePoint": str(restore_point) if restore_point else "",
+        "restartedServices": restarted_services,
+        "stages": stages,
+        "serviceChecklist": service_checklist,
+        "serviceChecklistOk": all(item.get("ok") for item in service_checklist),
+    }
 
 
 def run_restore_job(db: Session, data: RestoreRunPayload) -> dict:
     """Download a selected backup from FTP and validate or restore it."""
-    record = get_backup_settings_record(db)
+    host = (data.ftpHost or "").strip()
+    username = (data.ftpUsername or "").strip()
+    password = (data.ftpPassword or "").strip()
+    remote_path = (data.ftpRemotePath or "").strip() or "/"
+    backup_id = (data.backupId or "").strip()
     mode = (data.mode or "validate").strip().lower()
+    if mode not in {"validate", "restore"}:
+        raise HTTPException(status_code=400, detail="mode must be validate or restore")
+    if not host or not username or not password or not backup_id:
+        raise HTTPException(status_code=400, detail="ftp host, username, password, and backupId are required")
+
+    record = get_backup_settings_record(db)
+    staging_root = Path(RESTORE_STAGE_DIR)
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    ftp = ftp_connect(host, username, password)
     try:
-        return BACKUP_MGR.run_restore_job(
-            db,
-            host=(data.ftpHost or "").strip(),
-            username=(data.ftpUsername or "").strip(),
-            password=(data.ftpPassword or "").strip(),
-            remote_path=(data.ftpRemotePath or "").strip() or "/",
-            backup_id=(data.backupId or "").strip(),
-            mode=mode,
-            record=record,
-            append_log=append_backup_log,
-            send_slack_message=try_send_configured_slack_message,
-        )
-    except RestoreExecutionError:
-        raise
-    except RuntimeError as exc:
-        message = str(exc)
-        if message.startswith("mode must be"):
-            raise HTTPException(status_code=400, detail=message) from exc
-        if "required" in message or message.startswith("백업 검증 실패") or message.startswith("복구 사전 점검 실패"):
-            raise HTTPException(status_code=400, detail=message) from exc
-        raise
+        bundle_dir, downloaded = download_ftp_backup_bundle(ftp, remote_path, backup_id, staging_root)
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            ftp.close()
+
+    validation = validate_downloaded_backup_bundle(bundle_dir, downloaded)
+    preflight = build_restore_preflight_summary(bundle_dir, validation)
+    append_backup_log(
+        db,
+        record,
+        job_type="restore_preflight",
+        status="success" if preflight.get("ready") else "failed",
+        trigger="manual",
+        message="복구 사전 점검 완료" if preflight.get("ready") else "복구 사전 점검 실패",
+        detail=json.dumps(preflight, ensure_ascii=False, indent=2),
+    )
+    result = {"mode": mode, "validation": validation, "preflight": preflight}
+    if mode == "restore":
+        if not validation.get("valid"):
+            missing = validation.get("missingFiles", [])
+            raise HTTPException(
+                status_code=400,
+                detail=f"백업 검증 실패: 누락 파일 {missing} — 불완전한 백업은 복구할 수 없습니다.",
+            )
+        if not preflight.get("ready"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"복구 사전 점검 실패: {', '.join(preflight.get('failedChecks', [])) or 'free space or validation issue'}",
+            )
+        try:
+            result["restore"] = apply_restored_backup_bundle(bundle_dir)
+        except RestoreExecutionError as exc:
+            failed_result = {
+                "mode": mode,
+                "validation": validation,
+                "restore": exc.payload,
+            }
+            append_backup_log(
+                db,
+                record,
+                job_type="restore",
+                status="failed",
+                trigger="manual",
+                message="백업 복구 실패",
+                detail=json.dumps(failed_result, ensure_ascii=False, indent=2),
+            )
+            if record.slack_notify_backup_completed:
+                try_send_configured_slack_message(
+                    record,
+                    "restore_failed",
+                    {
+                        "backupId": validation.get("backupId") or backup_id,
+                        "modeLabel": "복구모드",
+                        "error": str(exc),
+                        "restorePoint": (exc.payload or {}).get("restorePoint", "-"),
+                        "failedStage": next(
+                            (
+                                stage.get("name")
+                                for stage in reversed((exc.payload or {}).get("stages", []))
+                                if stage.get("status") == "failed"
+                            ),
+                            "-",
+                        ),
+                    },
+                )
+            raise
+
+    append_backup_log(
+        db,
+        record,
+        job_type="restore_validate" if mode == "validate" else "restore",
+        status="success",
+        trigger="manual",
+        message="백업 검증 완료" if mode == "validate" else "백업 복구 완료",
+        detail=json.dumps(result, ensure_ascii=False, indent=2),
+    )
+    if record.slack_notify_backup_completed:
+        if mode == "validate":
+            try_send_configured_slack_message(
+                record,
+                "restore_validated",
+                {
+                    "backupId": validation.get("backupId") or backup_id,
+                    "dbObjectCountHint": validation.get("dbObjectCountHint", 0),
+                    "missingFileCount": len(validation.get("missingFiles", [])),
+                },
+            )
+        else:
+            restore_result = result.get("restore") or {}
+            try_send_configured_slack_message(
+                record,
+                "restore_completed",
+                {
+                    "backupId": validation.get("backupId") or backup_id,
+                    "restorePoint": restore_result.get("restorePoint", "-"),
+                    "stageCount": len(restore_result.get("stages", [])),
+                    "serviceChecklistOk": bool(restore_result.get("serviceChecklistOk")),
+                },
+            )
+
+    # 스테이징 디렉터리는 검증/복구 완료 후 정리
+    try:
+        shutil.rmtree(bundle_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    return result
 
 
 def create_backup_bundle(record: models.BackupSetting) -> tuple[Path, dict]:
     """Create a local backup bundle directory with DB/config artifacts."""
-    return BACKUP_MGR.create_backup_bundle(record)
+    return BACKUP_MGR.create_backup_bundle(
+        record,
+        pki_dir=PKI,
+        ccd_dir=CCD,
+        ccd_legacy_dir=CCD_LEGACY,
+        ccd_sfos_dir=CCD_SFOS,
+        openvpn_conf_path=OPENVPN_SERVER_CONF,
+        app_env_file=APP_ENV_FILE,
+        app_ui_dir=str(APP_UI_DIR),
+        database_url=os.environ["DATABASE_URL"],
+    )
 
 
 def run_backup_job(db: Session, record: models.BackupSetting, trigger: str = "manual") -> dict:
     """Create and upload a backup bundle using current persisted settings."""
-    if not (record.ftp_host or "").strip() or not (record.ftp_username or "").strip() or not record.ftp_password_enc:
+    host = (record.ftp_host or "").strip()
+    username = (record.ftp_username or "").strip()
+    remote_path = (record.ftp_remote_path or "").strip() or "/"
+    if not host or not username or not record.ftp_password_enc:
         raise HTTPException(status_code=400, detail="backup settings are incomplete")
-    return BACKUP_MGR.run_backup_job(
+    password = decrypt_backup_secret(record.ftp_password_enc)
+    bundle_dir: Path | None = None
+    manifest: dict = {}
+    uploaded: list[str] = []
+    validation: dict = {}
+    try:
+        bundle_dir, manifest = create_backup_bundle(record)
+        validation = build_local_backup_validation(bundle_dir)
+        append_backup_log(
+            db,
+            record,
+            job_type="backup_verify",
+            status="success" if validation.get("valid") else "failed",
+            trigger=trigger,
+            message="백업 자동 검증 완료" if validation.get("valid") else "백업 자동 검증 실패",
+            detail=json.dumps(validation, ensure_ascii=False, indent=2),
+        )
+        if not validation.get("valid"):
+            raise RuntimeError(f"backup verification failed: {validation.get('missingFiles', [])}")
+
+        ftp = ftp_connect(host, username, password)
+        try:
+            remote_dir = f"{remote_path.rstrip('/')}/{bundle_dir.name}" if remote_path.strip() else f"/{bundle_dir.name}"
+            uploaded = upload_dir_via_ftp(ftp, bundle_dir, remote_dir)
+        finally:
+            try:
+                ftp.quit()
+            except FTP_ERRORS:
+                ftp.close()
+    except BACKUP_IO_ERROR_TYPES as exc:
+        append_backup_log(
+            db,
+            record,
+            job_type="backup",
+            status="failed",
+            trigger=trigger,
+            message="백업 실행 실패",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    finally:
+        # FTP 업로드 완료(성공/실패 무관)후 로컬 번들 정리: 최근 5개만 유지
+        try:
+            root = Path(BACKUP_BASE_DIR)
+            bundles = sorted(root.glob("backup_*"), key=lambda p: p.name, reverse=True)
+            for old_bundle in bundles[5:]:
+                shutil.rmtree(old_bundle, ignore_errors=True)
+        except OSError:
+            LOGGER.exception("failed to clean old backup bundles")
+
+    log_entry = append_backup_log(
         db,
         record,
-        decrypt_secret=decrypt_backup_secret,
-        append_log=append_backup_log,
-        send_slack_message=try_send_configured_slack_message,
+        job_type="backup",
+        status="success",
         trigger=trigger,
+        message=f"백업 실행 완료 ({bundle_dir.name})",
+        detail=json.dumps({"backupId": bundle_dir.name, "uploaded": uploaded, "manifest": manifest, "validation": validation}, ensure_ascii=False, indent=2),
     )
+    if record.slack_notify_backup_completed:
+        try_send_configured_slack_message(record, "backup_completed")
+    return {"backupId": bundle_dir.name, "uploaded": uploaded, "manifest": manifest, "validation": validation, "log": log_entry}
 
 
 def run_backup_test_connection(settings: BackupSettingsPayload) -> dict:
     """Validate FTP connectivity with the current form values before saving."""
-    return BACKUP_MGR.run_backup_test_connection(
-        host=(settings.ftpHost or "").strip(),
-        username=(settings.ftpUsername or "").strip(),
-        password=(settings.ftpPassword or "").strip(),
-        remote_path=(settings.ftpRemotePath or "").strip() or "/",
-    )
+    host = (settings.ftpHost or "").strip()
+    username = (settings.ftpUsername or "").strip()
+    password = (settings.ftpPassword or "").strip()
+    remote_path = (settings.ftpRemotePath or "").strip() or "/"
+    if not host or not username or not password:
+        raise HTTPException(status_code=400, detail="ftp host, username, and password are required")
+    ftp = ftp_connect(host, username, password)
+    try:
+        resolved = ensure_ftp_remote_dir(ftp, remote_path)
+        listing = ftp.nlst()[:10]
+    finally:
+        try:
+            ftp.quit()
+        except FTP_ERRORS:
+            ftp.close()
+    return {"ok": True, "remotePath": resolved, "sample": listing}
 
 
 def build_schedule_run_key(record: models.BackupSetting, now_local: datetime) -> str:
@@ -1930,11 +2276,6 @@ def ensure_backup_scheduler_started() -> None:
         return
     BACKUP_SCHEDULER_THREAD = threading.Thread(target=backup_scheduler_loop, name="backup-scheduler", daemon=True)
     BACKUP_SCHEDULER_THREAD.start()
-
-
-def now_utc_ts() -> int:
-    """Return current UTC timestamp as int seconds."""
-    return int(datetime.now(tz=timezone.utc).timestamp())
 
 
 def resolve_request_ip(request: Request) -> str:
@@ -2369,108 +2710,6 @@ def auth_logout(request: Request):
     return response
 
 
-def ensure_server_conf_route(server_conf_path: str, target_ip: str):
-    """Ensure per-host route exists in server conf (deduplicated)."""
-    try:
-        normalized_ip = str(ipaddress.ip_address(str(target_ip).strip()))
-    except ValueError as e:
-        raise RuntimeError(f"invalid route target ip: {target_ip}") from e
-
-    route_line = f"route {normalized_ip} 255.255.255.255"
-    conf = Path(server_conf_path)
-    if not conf.exists():
-        raise RuntimeError(f"server conf not found: {server_conf_path}")
-
-    try:
-        current = conf.read_text(encoding="utf-8", errors="ignore").splitlines()
-        if any(line.strip() == route_line for line in current):
-            return
-        if current and current[-1].strip():
-            current.append("")
-        current.append(route_line)
-        conf.write_text("\n".join(current) + "\n", encoding="utf-8")
-    except OSError as e:
-        raise RuntimeError(f"failed to update route in {server_conf_path}: {e}") from e
-
-
-def ensure_server_conf_host_routes(server_conf_path: str, cidr: str):
-    """Ensure every host in the given CIDR exists as a /32 route in server conf."""
-    try:
-        network = ipaddress.ip_network(str(cidr).strip(), strict=False)
-    except ValueError as e:
-        raise RuntimeError(f"invalid host route cidr: {cidr}") from e
-
-    desired_routes = {
-        f"route {host} 255.255.255.255"
-        for host in network.hosts()
-    }
-    conf = Path(server_conf_path)
-    if not conf.exists():
-        raise RuntimeError(f"server conf not found: {server_conf_path}")
-
-    try:
-        current = conf.read_text(encoding="utf-8", errors="ignore").splitlines()
-        existing = {line.strip() for line in current}
-        missing = [line for line in sorted(desired_routes, key=lambda line: tuple(int(part) for part in line.split()[1].split("."))) if line not in existing]
-        if not missing:
-            return
-        insert_at = 0
-        for idx, line in enumerate(current):
-            if line.strip().startswith("ca "):
-                insert_at = idx
-                break
-        updated = current[:insert_at] + missing + ([""] if insert_at > 0 and (not current[:insert_at] or current[insert_at - 1].strip()) else []) + current[insert_at:]
-        conf.write_text("\n".join(updated).rstrip() + "\n", encoding="utf-8")
-    except OSError as e:
-        raise RuntimeError(f"failed to update host routes in {server_conf_path}: {e}") from e
-
-
-def ensure_server_conf_network_route(server_conf_path: str, cidr: str):
-    """Ensure a CIDR-wide route exists in server conf (deduplicated)."""
-    try:
-        network = ipaddress.ip_network(str(cidr).strip(), strict=False)
-    except ValueError as e:
-        raise RuntimeError(f"invalid route cidr: {cidr}") from e
-
-    route_line = f"route {network.network_address} {network.netmask}"
-    conf = Path(server_conf_path)
-    if not conf.exists():
-        raise RuntimeError(f"server conf not found: {server_conf_path}")
-
-    try:
-        current = conf.read_text(encoding="utf-8", errors="ignore").splitlines()
-        if any(line.strip() == route_line for line in current):
-            return
-        if current and current[-1].strip():
-            current.append("")
-        current.append(route_line)
-        conf.write_text("\n".join(current) + "\n", encoding="utf-8")
-    except OSError as e:
-        raise RuntimeError(f"failed to update route in {server_conf_path}: {e}") from e
-
-
-def write_ccd_entry_and_route(
-    *,
-    ccd_dir: str,
-    hostname: str,
-    assigned_ip: str,
-    route_gateway_ip: str,
-    server_conf_path: str,
-):
-    """Write CCD entry.
-
-    Host/network routes are managed centrally in the server conf files,
-    so enroll/APC should not append per-client route lines anymore.
-    """
-    VPN_CFG_MGR.write_ccd_entry(
-        hostname=hostname,
-        assigned_ip=assigned_ip,
-        gateway_ip=route_gateway_ip,
-        ccd_dir=ccd_dir,
-        push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
-    )
-
-
 def build_client_cert_if_missing(hostname: str):
     """Create client cert via EasyRSA when missing and return paths."""
     ca_path = Path(PKI) / "pki" / "ca.crt"
@@ -2536,88 +2775,19 @@ def ensure_client_material(hostname: str):
     return ca_pem, crt_pem, key_pem
 
 
-def write_openvpn_bundle(hostname: str, ca_cert: str, certificate: str, key: str, vpn_port: int | None = None) -> tuple[str, Path]:
+def write_openvpn_bundle(hostname: str, ca_cert: str, certificate: str, key: str, vpn_port: int | None = None) -> str:
     """Build and archive deployable OpenVPN client bundle."""
     return VPN_CFG_MGR.write_openvpn_bundle(
-        hostname=hostname,
-        ca_cert=ca_cert,
-        certificate=certificate,
-        key=key,
+        hostname,
+        ca_cert,
+        certificate,
+        key,
+        server_ip=OPENVPN_SERVER_IP,
+        default_port=OPENVPN_PORT,
         vpn_port=vpn_port,
+        pki_dir=PKI,
+        templates_dir=str(TEMPLATES_DIR),
     )
-
-
-def format_dt(value) -> str:
-    """Format datetime as Korea-time display string."""
-    if not value:
-        return ""
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S KST")
-    return str(value)
-
-
-def estimate_expire(created_at) -> str:
-    """Estimate expiration date as created_at + 3650 days."""
-    if not isinstance(created_at, datetime):
-        return ""
-    if created_at.tzinfo is None:
-        created_at = created_at.replace(tzinfo=timezone.utc)
-    return (created_at + timedelta(days=3650)).date().isoformat()
-
-
-def get_certificate_expire_at(cert_cn: str, created_at=None) -> str:
-    """Return actual certificate expiry date from issued cert, falling back to estimated expiry."""
-    cert_cn = (cert_cn or "").strip()
-    candidate_paths = [
-        Path(PKI) / "pki" / "issued" / f"{cert_cn}.crt",
-        Path(PKI) / "issued" / f"{cert_cn}.crt",
-        Path("/etc/openvpn/certs") / f"{cert_cn}.crt",
-    ]
-    for cert_path in candidate_paths:
-        if not cert_path.exists():
-            continue
-        try:
-            result = subprocess.run(["openssl", "x509", "-enddate", "-noout", "-in", str(cert_path)], check=True, capture_output=True, text=True)
-            raw = result.stdout.strip()
-            if raw.startswith("notAfter="):
-                value = raw.split("=", 1)[1].strip()
-                parsed = datetime.strptime(value, "%b %d %H:%M:%S %Y %Z")
-                return parsed.date().isoformat()
-        except Exception:
-            continue
-    return estimate_expire(created_at)
-
-
-def read_openvpn_connected_cns(status_file: str) -> set[str]:
-    """Parse connected CN set from OpenVPN status file."""
-    return VPN_CFG_MGR.read_connected_common_names(status_file=status_file)
-
-
-def resolve_openvpn_status_file(config_path: str, fallback: str) -> str:
-    """Resolve status file path from conf, or fallback if unavailable."""
-    override_path = ""
-    if config_path == OPENVPN_SERVER_CONF:
-        override_path = os.environ.get("OPENVPN_STATUS_FILE", "")
-    elif config_path == SFOS_SERVER_CONF:
-        override_path = os.environ.get("SFOS_STATUS_FILE", "")
-    return VPN_CFG_MGR.resolve_status_file(
-        config_path=config_path,
-        fallback=fallback,
-        override_path=override_path,
-    )
-
-
-def is_systemd_service_active(service_name: str) -> bool:
-    """Check whether a systemd service is active."""
-    result = subprocess.run(
-        ["systemctl", "is-active", service_name],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0 and result.stdout.strip() == "active"
 
 
 def collect_runtime_service_statuses() -> list[dict]:
@@ -2629,43 +2799,22 @@ def collect_runtime_service_statuses() -> list[dict]:
     except SQLAlchemyError:
         db_ok = False
 
-    openvpn_status_path = resolve_openvpn_status_file(OPENVPN_SERVER_CONF, OPENVPN_STATUS_FILE)
-    openvpn_legacy_status_path = OPENVPN_LEGACY_STATUS_FILE
-    sfos_status_path = resolve_openvpn_status_file(SFOS_SERVER_CONF, SFOS_STATUS_FILE)
-    openvpn_connected = read_openvpn_connected_cns(openvpn_status_path)
-    openvpn_legacy_connected = read_openvpn_connected_cns(openvpn_legacy_status_path)
-    sfos_connected = read_openvpn_connected_cns(sfos_status_path)
-
-    openvpn_service_up = is_systemd_service_active("openvpn-server@server.service")
-    openvpn_legacy_service_up = is_systemd_service_active("openvpn-server@server-legacy.service")
-    sfos_service_up = is_systemd_service_active("openvpn-server@server-sfos.service")
-
-    return [
-        {
-            "name": "openvpn-server@server",
-            "status": "active" if openvpn_service_up and len(openvpn_connected) > 0 else ("disconnected" if openvpn_service_up else "stopped"),
-            "port": f"{OPENVPN_PORT}/udp",
-            "nominal": "active",
-        },
-        {
-            "name": "openvpn-server@server-legacy",
-            "status": "active" if openvpn_legacy_service_up and len(openvpn_legacy_connected) > 0 else ("disconnected" if openvpn_legacy_service_up else "stopped"),
-            "port": f"{OPENVPN_LEGACY_PORT}/udp",
-            "nominal": "active",
-        },
-        {
-            "name": "openvpn-server@sfos",
-            "status": "active" if sfos_service_up and len(sfos_connected) > 0 else ("disconnected" if sfos_service_up else "stopped"),
-            "port": f"{SFOS_VPN_PORT}/tcp",
-            "nominal": "active",
-        },
-        {
-            "name": "certsvc-db",
-            "status": "running" if db_ok else "stopped",
-            "port": "5432/tcp",
-            "nominal": "running",
-        },
-    ]
+    conn_sets = VPN_CFG_MGR.collect_connection_sets(
+        openvpn_server_conf=OPENVPN_SERVER_CONF,
+        openvpn_status_file=OPENVPN_STATUS_FILE,
+        openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
+        sfos_server_conf=SFOS_SERVER_CONF,
+        sfos_status_file=SFOS_STATUS_FILE,
+    )
+    return VPN_CFG_MGR.build_runtime_service_statuses(
+        db_ok=db_ok,
+        openvpn_connected_count=len(conn_sets["openvpnConnected"]),
+        openvpn_legacy_connected_count=len(conn_sets["openvpnLegacyConnected"]),
+        sfos_connected_count=len(conn_sets["sfosConnected"]),
+        openvpn_port=OPENVPN_PORT,
+        openvpn_legacy_port=OPENVPN_LEGACY_PORT,
+        sfos_vpn_port=SFOS_VPN_PORT,
+    )
 
 
 def alert_monitor_loop() -> None:
@@ -2684,7 +2833,7 @@ def alert_monitor_loop() -> None:
                     resources=resources,
                     active_clients=active_clients,
                     assigned_ip_map=assigned_ip_map,
-                    get_certificate_expire_at=lambda client: get_certificate_expire_at(client.cert_cn or client.hostname, client.created_at),
+                    get_certificate_expire_at=lambda client: get_certificate_expire_at_util(client.cert_cn or client.hostname, client.created_at, pki_dir=PKI),
                     send_slack=lambda template_type, payload: try_send_configured_slack_message(record, template_type, payload=payload),
                 )
         except (SQLAlchemyError, OSError, RuntimeError, ValueError) as exc:
@@ -2723,7 +2872,7 @@ def upsert_client_and_credential(
     SFOS 관리자 비밀번호는 credentials.sfos_admin_password_enc 에 별도 암호화 저장한다.
     기존 sha256$ 형식 레코드는 복호화 불가이므로 최초 1회 rotate 처리한다.
     """
-    ip = canonical_ip(ip)
+    ip = IP_LEASE_MGR.canonical_ip(ip)
     username = make_sfos_username(hostname)
     client = db.query(models.Client).filter_by(hostname=hostname, vpn_type="sfos").first()
     if not client:
@@ -2789,30 +2938,8 @@ def startup_runtime() -> None:
     ensure_equipment_schema()
     sync_legacy_client_flags()
     ensure_backup_schema()
-    if MOCK_MODE:
-        with Session(DB_ENGINE) as db:
-            seed_mock_environment(
-                db=db,
-                encrypt_secret=encrypt_backup_secret,
-                backup_base_dir=BACKUP_BASE_DIR,
-                client_backup_base_dir=CLIENT_BACKUP_BASE_DIR,
-                pki_dir=PKI,
-                ccd_dir=CCD,
-                ccd_legacy_dir=CCD_LEGACY,
-                ccd_sfos_dir=CCD_SFOS,
-                openvpn_status_file=OPENVPN_STATUS_FILE,
-                openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
-                sfos_status_file=SFOS_STATUS_FILE,
-                openvpn_server_conf=OPENVPN_SERVER_CONF,
-                sfos_server_conf=SFOS_SERVER_CONF,
-                security_state_file=SECURITY_STATE_FILE,
-                runtime_guard_log_file=RUNTIME_GUARD_LOG_FILE,
-                feature_log_dir=str(CERTSVC_FEATURE_LOG_DIR),
-            )
-        LOGGER.info("mock mode enabled data_dir=%s", MOCK_DATA_DIR)
-    else:
-        ensure_backup_scheduler_started()
-        ensure_alert_monitor_started()
+    ensure_backup_scheduler_started()
+    ensure_alert_monitor_started()
 
 
 @app.get("/health")
@@ -2832,14 +2959,6 @@ def health(db: Session = Depends(get_db)):
         "uiDist": ui_index_exists,
         "backupDir": Path(BACKUP_BASE_DIR).exists(),
     }
-    if MOCK_MODE:
-        if not ui_index_exists and APP_UI_DIR.exists():
-            dir_checks["uiDist"] = True
-        return build_mock_health(
-            db_ok=db_ok,
-            checks=dir_checks,
-            now_label=now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
-        )
     status = "ok" if db_ok and all(dir_checks.values()) else "degraded"
     return {
         "status": status,
@@ -2882,6 +3001,147 @@ def list_equipment_assets(
         )
         for asset in assets
     ]
+
+
+@app.post("/equipment-assets/manual")
+def create_equipment_asset_manual(
+    data: EquipmentAssetManualCreatePayload,
+    _: dict | None = Depends(require_web_or_internal_access),
+    db: Session = Depends(get_db),
+):
+    """Create a single equipment asset from the admin UI."""
+    serial_number = normalize_serial_number(data.serialNumber)
+    device_model = normalize_device_model(data.deviceModel)
+
+    existing = db.query(models.EquipmentAsset).filter_by(serial_number=serial_number).first()
+    if existing is not None:
+        raise HTTPException(status_code=409, detail="이미 등록된 시리얼입니다.")
+
+    asset = upsert_equipment_asset(
+        db,
+        serial_number=serial_number,
+        device_model=device_model,
+        event_type=ASSET_HISTORY_MANUAL,
+        event_summary="관리자 수동 등록으로 장비 정보가 반영되었습니다.",
+        event_detail=f"수동 등록: serial={serial_number}, model={device_model}",
+        created_by="security-console",
+    )
+    db.commit()
+    db.refresh(asset)
+
+    return {
+        "ok": True,
+        "mode": "created",
+        "asset": serialize_equipment_asset(asset),
+    }
+
+
+@app.get("/equipment-assets/import/template")
+def download_equipment_assets_template(
+    _: dict | None = Depends(require_web_or_internal_access),
+):
+    """Download an Excel template for bulk equipment serial/model registration."""
+    if not EQUIPMENT_ASSETS_TEMPLATE_PATH.is_file():
+        raise HTTPException(status_code=500, detail="equipment asset template file is missing")
+
+    return FileResponse(
+        EQUIPMENT_ASSETS_TEMPLATE_PATH,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename="equipment_assets_template.xlsx",
+    )
+
+
+@app.post("/equipment-assets/import")
+async def import_equipment_assets_excel(
+    file: UploadFile = File(...),
+    _: dict | None = Depends(require_web_or_internal_access),
+    db: Session = Depends(get_db),
+):
+    """Bulk import equipment assets from an Excel file."""
+    filename = (file.filename or "").strip().lower()
+    if not filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="only .xlsx files are supported")
+
+    try:
+        from openpyxl import load_workbook
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="openpyxl is required for excel import") from exc
+
+    payload = await file.read()
+    await file.close()
+    if not payload:
+        raise HTTPException(status_code=400, detail="empty excel file")
+
+    try:
+        wb = load_workbook(filename=io.BytesIO(payload), read_only=True, data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"invalid excel format: {exc}") from exc
+
+    ws = wb.active
+    rows = ws.iter_rows(values_only=True)
+    header = next(rows, None)
+    if not header:
+        raise HTTPException(status_code=400, detail="excel header row is missing")
+
+    def normalize_header(value: object) -> str:
+        return re.sub(r"[^0-9a-z가-힣]+", "", str(value or "").strip().lower())
+
+    normalized_headers = [normalize_header(value) for value in header]
+    serial_candidates = {"serialnumber", "serial", "시리얼", "시리얼넘버"}
+    model_candidates = {"devicemodel", "model", "장비명모델", "장비모델"}
+
+    serial_idx = next((idx for idx, col in enumerate(normalized_headers) if col in serial_candidates), None)
+    model_idx = next((idx for idx, col in enumerate(normalized_headers) if col in model_candidates), None)
+    if serial_idx is None or model_idx is None:
+        raise HTTPException(status_code=400, detail="header must include 시리얼 and 장비명/모델 columns")
+
+    created = 0
+    duplicates = 0
+    skipped = 0
+    row_errors: list[str] = []
+
+    for row_number, row in enumerate(rows, start=2):
+        raw_serial = str((row[serial_idx] if serial_idx < len(row) else "") or "").strip()
+        raw_model = str((row[model_idx] if model_idx < len(row) else "") or "").strip()
+        if not raw_serial and not raw_model:
+            continue
+        if not raw_serial or not raw_model:
+            skipped += 1
+            row_errors.append(f"row {row_number}: serialNumber/deviceModel are required")
+            continue
+
+        try:
+            serial_number = normalize_serial_number(raw_serial)
+            device_model = normalize_device_model(raw_model)
+            existing = db.query(models.EquipmentAsset).filter_by(serial_number=serial_number).first()
+            if existing is not None:
+                duplicates += 1
+                skipped += 1
+                row_errors.append(f"row {row_number}: 이미 등록된 시리얼입니다. ({serial_number})")
+                continue
+
+            upsert_equipment_asset(
+                db,
+                serial_number=serial_number,
+                device_model=device_model,
+                event_type=ASSET_HISTORY_IMPORT,
+                event_summary="엑셀 일괄 등록으로 장비 정보가 반영되었습니다.",
+                event_detail=f"엑셀 등록: row={row_number}, serial={serial_number}, model={device_model}",
+                created_by="security-console",
+            )
+            created += 1
+        except HTTPException as exc:
+            skipped += 1
+            row_errors.append(f"row {row_number}: {exc.detail}")
+
+    db.commit()
+    return {
+        "ok": True,
+        "created": created,
+        "duplicates": duplicates,
+        "skipped": skipped,
+        "errors": row_errors,
+    }
 
 
 @app.post("/equipment-assets/sync/callback")
@@ -2933,7 +3193,7 @@ def trigger_equipment_asset_sync(
     assigned_ip = ""
     if client is not None:
         lease = db.query(models.IPLease).filter_by(client_id=client.id).first()
-        assigned_ip = canonical_ip(lease.assigned_ip) if lease and lease.assigned_ip else ""
+        assigned_ip = canonical_ip_util(lease.assigned_ip) if lease and lease.assigned_ip else ""
 
     result = try_send_inventory_sync(
         db,
@@ -2953,12 +3213,16 @@ def list_clients(
 ):
     """Return client list enriched with live connection status."""
     clients = db.query(models.Client).order_by(models.Client.created_at.desc()).all()
-    openvpn_status_path = resolve_openvpn_status_file(OPENVPN_SERVER_CONF, OPENVPN_STATUS_FILE)
-    openvpn_legacy_status_path = OPENVPN_LEGACY_STATUS_FILE
-    sfos_status_path = resolve_openvpn_status_file(SFOS_SERVER_CONF, SFOS_STATUS_FILE)
-    openvpn_connected = read_openvpn_connected_cns(openvpn_status_path)
-    openvpn_legacy_connected = read_openvpn_connected_cns(openvpn_legacy_status_path)
-    sfos_connected = read_openvpn_connected_cns(sfos_status_path)
+    conn_sets = VPN_CFG_MGR.collect_connection_sets(
+        openvpn_server_conf=OPENVPN_SERVER_CONF,
+        openvpn_status_file=OPENVPN_STATUS_FILE,
+        openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
+        sfos_server_conf=SFOS_SERVER_CONF,
+        sfos_status_file=SFOS_STATUS_FILE,
+    )
+    openvpn_connected = conn_sets["openvpnConnected"]
+    openvpn_legacy_connected = conn_sets["openvpnLegacyConnected"]
+    sfos_connected = conn_sets["sfosConnected"]
     assigned_ip_map = build_assigned_ip_map(db)
     equipment_rows = db.query(models.EquipmentAsset.client_id, models.EquipmentAsset.serial_number).all()
     serial_by_client_id = {
@@ -2976,12 +3240,19 @@ def list_clients(
             changed = changed or (before_flag != is_legacy_client)
         else:
             is_legacy_client = False
-        if client.vpn_type == "openvpn":
-            is_connected = cn in (openvpn_legacy_connected if is_legacy_client else openvpn_connected)
-        elif client.vpn_type == "sfos":
-            is_connected = cn in sfos_connected
-        else:
-            is_connected = False
+        display_vpn_type = VPN_CFG_MGR.normalize_display_vpn_type(
+            client.vpn_type,
+            is_legacy_openvpn=is_legacy_client,
+        )
+        computed = VPN_CFG_MGR.compute_client_connection_status(
+            display_vpn_type=display_vpn_type,
+            is_active=(client.status or "").strip().lower() != "inactive",
+            identity=cn,
+            openvpn_connected=openvpn_connected,
+            openvpn_legacy_connected=openvpn_legacy_connected,
+            sfos_connected=sfos_connected,
+        )
+        is_connected = computed == "active"
 
         current_status = (client.status or "").strip().lower()
         if current_status == "inactive":
@@ -2999,9 +3270,9 @@ def list_clients(
                 "assignedIp": assigned_ip_map.get(client.id, ""),
                 "isLegacy": is_legacy_client,
                 "status": display_status,
-                "expireAt": get_certificate_expire_at(client.cert_cn or client.hostname, client.created_at),
-                "registeredAt": format_dt(client.created_at),
-                "lastSeenAt": format_dt(client.updated_at),
+                "expireAt": get_certificate_expire_at_util(client.cert_cn or client.hostname, client.created_at, pki_dir=PKI),
+                "registeredAt": format_display_datetime_util(client.created_at, DISPLAY_TIMEZONE),
+                "lastSeenAt": format_display_datetime_util(client.updated_at, DISPLAY_TIMEZONE),
                 "mac": client.mac or "",
                 "serialNumber": serial_by_client_id.get(client.id, ""),
                 "tenant": "",
@@ -3117,7 +3388,7 @@ def get_client_backup_info(
             "filename": latest_file.name,
             "sizeBytes": int(stat.st_size),
             "updatedAt": modified_at.isoformat(),
-            "updatedAtDisplay": format_dt(modified_at),
+            "updatedAtDisplay": format_display_datetime_util(modified_at, DISPLAY_TIMEZONE),
         },
     }
 
@@ -3152,44 +3423,47 @@ def list_leases(
     db: Session = Depends(get_db),
 ):
     """Return lease list with computed connection status."""
-    openvpn_status_path = resolve_openvpn_status_file(OPENVPN_SERVER_CONF, OPENVPN_STATUS_FILE)
-    openvpn_legacy_status_path = OPENVPN_LEGACY_STATUS_FILE
-    sfos_status_path = resolve_openvpn_status_file(SFOS_SERVER_CONF, SFOS_STATUS_FILE)
-    openvpn_connected = read_openvpn_connected_cns(openvpn_status_path)
-    openvpn_legacy_connected = read_openvpn_connected_cns(openvpn_legacy_status_path)
-    sfos_connected = read_openvpn_connected_cns(sfos_status_path)
-    legacy_openvpn_identities = {
-        (client.cert_cn or client.hostname or "").strip()
-        for client in db.query(models.Client).filter_by(vpn_type="openvpn").all()
-        if is_legacy_openvpn_client(client)
-    }
+    conn_sets = VPN_CFG_MGR.collect_connection_sets(
+        openvpn_server_conf=OPENVPN_SERVER_CONF,
+        openvpn_status_file=OPENVPN_STATUS_FILE,
+        openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
+        sfos_server_conf=SFOS_SERVER_CONF,
+        sfos_status_file=SFOS_STATUS_FILE,
+    )
+    openvpn_connected = conn_sets["openvpnConnected"]
+    openvpn_legacy_connected = conn_sets["openvpnLegacyConnected"]
+    sfos_connected = conn_sets["sfosConnected"]
 
     clients = db.query(models.Client).order_by(models.Client.updated_at.desc()).all()
     assigned_ip_map = build_assigned_ip_map(db)
+    lease_activity_map = {
+        int(row.client_id): bool(row.is_active)
+        for row in db.query(models.IPLease.client_id, models.IPLease.is_active).all()
+        if row.client_id is not None
+    }
 
     result = []
     for client in clients:
-        display_vpn_type = client.vpn_type
-        if client.vpn_type == "openvpn" and is_legacy_openvpn_client(client):
-            display_vpn_type = "openvpn-legacy"
+        display_vpn_type = VPN_CFG_MGR.normalize_display_vpn_type(
+            client.vpn_type,
+            is_legacy_openvpn=(client.vpn_type == "openvpn" and is_legacy_openvpn_client(client)),
+        )
 
         if vpn_type and display_vpn_type != vpn_type:
             continue
 
         identity = (client.hostname or "").strip()
         assigned_ip = assigned_ip_map.get(client.id, "")
-        lease = db.query(models.IPLease).filter_by(client_id=client.id).first()
-        is_active = bool(getattr(lease, "is_active", True)) if lease else True
+        is_active = lease_activity_map.get(client.id, True)
 
-        if not is_active:
-            status = "inactive"
-        elif display_vpn_type in {"openvpn", "openvpn-legacy"}:
-            openvpn_pool = openvpn_legacy_connected if display_vpn_type == "openvpn-legacy" else openvpn_connected
-            status = "active" if identity in openvpn_pool else "disconnected"
-        elif display_vpn_type == "sfos":
-            status = "active" if identity in sfos_connected else "disconnected"
-        else:
-            status = "inactive"
+        status = VPN_CFG_MGR.compute_client_connection_status(
+            display_vpn_type=display_vpn_type,
+            is_active=is_active,
+            identity=identity,
+            openvpn_connected=openvpn_connected,
+            openvpn_legacy_connected=openvpn_legacy_connected,
+            sfos_connected=sfos_connected,
+        )
 
         result.append(
             {
@@ -3198,7 +3472,7 @@ def list_leases(
                 "assignedIp": assigned_ip,
                 "isActive": is_active,
                 "status": status,
-                "updatedAt": format_dt(client.updated_at),
+                "updatedAt": format_display_datetime_util(client.updated_at, DISPLAY_TIMEZONE),
             }
         )
     return result
@@ -3243,18 +3517,6 @@ def system_status(
     db: Session = Depends(get_db),
 ):
     """Return service statuses and host resource metrics."""
-    if MOCK_MODE:
-        return build_mock_system_status(
-            openvpn_port=OPENVPN_PORT,
-            legacy_port=OPENVPN_LEGACY_PORT,
-            sfos_port=SFOS_VPN_PORT,
-            dirs={
-                "pki": Path(PKI).exists(),
-                "ccd": Path(CCD).exists(),
-                "ccd_sfos": Path(CCD_SFOS).exists(),
-            },
-        )
-
     def service_active(service_name: str) -> bool:
         """Check whether a systemd service is active."""
         result = subprocess.run(
@@ -3271,12 +3533,12 @@ def system_status(
     except Exception:
         db_ok = False
 
-    openvpn_status_path = resolve_openvpn_status_file(OPENVPN_SERVER_CONF, OPENVPN_STATUS_FILE)
+    openvpn_status_path = VPN_CFG_MGR.resolve_openvpn_status_file(OPENVPN_SERVER_CONF, OPENVPN_STATUS_FILE, openvpn_server_conf=OPENVPN_SERVER_CONF, sfos_server_conf=SFOS_SERVER_CONF)
     openvpn_legacy_status_path = OPENVPN_LEGACY_STATUS_FILE
-    sfos_status_path = resolve_openvpn_status_file(SFOS_SERVER_CONF, SFOS_STATUS_FILE)
-    openvpn_connected = read_openvpn_connected_cns(openvpn_status_path)
-    openvpn_legacy_connected = read_openvpn_connected_cns(openvpn_legacy_status_path)
-    sfos_connected = read_openvpn_connected_cns(sfos_status_path)
+    sfos_status_path = VPN_CFG_MGR.resolve_openvpn_status_file(SFOS_SERVER_CONF, SFOS_STATUS_FILE, openvpn_server_conf=OPENVPN_SERVER_CONF, sfos_server_conf=SFOS_SERVER_CONF)
+    openvpn_connected = VPN_CFG_MGR.read_openvpn_connected_cns(openvpn_status_path)
+    openvpn_legacy_connected = VPN_CFG_MGR.read_openvpn_connected_cns(openvpn_legacy_status_path)
+    sfos_connected = VPN_CFG_MGR.read_openvpn_connected_cns(sfos_status_path)
 
     openvpn_service_up = service_active("openvpn-server@server.service")
     openvpn_legacy_service_up = service_active("openvpn-server@server-legacy.service")
@@ -3389,11 +3651,6 @@ def get_backup_status(
 ):
     """Return latest backup integrity summary without changing the UI."""
     record = get_backup_settings_record(db)
-    if MOCK_MODE:
-        return build_mock_backup_status(
-            backup_base_dir=BACKUP_BASE_DIR,
-            now_label=now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
-        )
     return summarize_backup_status(record)
 
 
@@ -3418,15 +3675,7 @@ def test_backup_settings(
         passwordChanged=True,
     )
     try:
-        if MOCK_MODE:
-            result = {
-                "ok": True,
-                "remotePath": (payload.ftpRemotePath or "/").strip() or "/",
-                "sample": ["backup_20260504_090000"],
-                "mock": True,
-            }
-        else:
-            result = run_backup_test_connection(payload)
+        result = run_backup_test_connection(payload)
         append_backup_log(
             db,
             record,
@@ -3507,19 +3756,7 @@ def run_backup_now(
     record = get_backup_settings_record(db)
     with BACKUP_LOCK:
         try:
-            if MOCK_MODE:
-                result = build_mock_backup_result(backup_base_dir=BACKUP_BASE_DIR)
-                append_backup_log(
-                    db,
-                    record,
-                    job_type="backup",
-                    status="success",
-                    trigger="manual",
-                    message=f"백업 실행 완료 ({result['backupId']})",
-                    detail=json.dumps(result, ensure_ascii=False, indent=2),
-                )
-            else:
-                result = run_backup_job(db, record, trigger="manual")
+            result = run_backup_job(db, record, trigger="manual")
         except HTTPException:
             raise
         except Exception as exc:
@@ -3542,21 +3779,6 @@ def list_restore_backups(
     if not host or not username or not password:
         raise HTTPException(status_code=400, detail="ftp host, username, and password are required")
     try:
-        if MOCK_MODE:
-            result = build_mock_restore_list(
-                backup_base_dir=BACKUP_BASE_DIR,
-                remote_path=remote_path,
-            )
-            append_backup_log(
-                db,
-                record,
-                job_type="restore_list",
-                status="success",
-                trigger="manual",
-                message="복구 백업 목록 조회 완료",
-                detail=json.dumps(result, ensure_ascii=False, indent=2),
-            )
-            return result
         ftp = ftp_connect(host, username, password)
         try:
             resolved = ensure_ftp_remote_dir(ftp, remote_path)
@@ -3600,24 +3822,7 @@ def run_restore_now(
     """Download a selected backup bundle and validate or restore it."""
     with BACKUP_LOCK:
         try:
-            if MOCK_MODE:
-                result = build_mock_restore_result(
-                    backup_base_dir=BACKUP_BASE_DIR,
-                    backup_id=(data.backupId or "").strip(),
-                    mode=(data.mode or "validate").strip().lower(),
-                    now_label=now_kst().strftime("%Y-%m-%d %H:%M:%S KST"),
-                )
-                append_backup_log(
-                    db,
-                    get_backup_settings_record(db),
-                    job_type="restore_validate" if (data.mode or "validate").lower() == "validate" else "restore",
-                    status="success",
-                    trigger="manual",
-                    message="백업 검증 완료" if (data.mode or "validate").lower() == "validate" else "백업 복구 완료",
-                    detail=json.dumps(result, ensure_ascii=False, indent=2),
-                )
-            else:
-                result = run_restore_job(db, data)
+            result = run_restore_job(db, data)
         except HTTPException:
             raise
         except RestoreExecutionError as exc:
@@ -3811,15 +4016,8 @@ def send_slack_test_message(
     channel = (record.slack_channel or SECURITY_SLACK_DEFAULT_CHANNEL).strip() or SECURITY_SLACK_DEFAULT_CHANNEL
     bot_token = decrypt_backup_secret(record.slack_bot_token_enc)
     try:
-        if MOCK_MODE:
-            result = build_mock_slack_response(
-                channel=channel,
-                template_type=(data.templateType or "").strip(),
-            )
-            response = result["response"]
-        else:
-            text, blocks = build_slack_test_payload((data.templateType or "").strip())
-            response = send_slack_message(bot_token, channel, text, blocks)
+        text, blocks = build_slack_test_payload((data.templateType or "").strip())
+        response = send_slack_message(bot_token, channel, text, blocks)
         append_backup_log(
             db,
             record,
@@ -3914,7 +4112,7 @@ def unban_security_ip(
 ):
     """Release a banned IP after manual review."""
     try:
-        target_ip = canonical_ip(data.ip)
+        target_ip = canonical_ip_util(data.ip)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"invalid IP address: {data.ip!r}")
     ALERT_MGR.unban_ip(target_ip, note=(data.note or "").strip())
@@ -4078,12 +4276,12 @@ def enroll(request: Request, data: EnrollPayload, db: Session = Depends(get_db))
                     trigger="enroll",
                 )
 
-        write_ccd_entry_and_route(
+        VPN_CFG_MGR.write_ccd_entry_and_route(
             ccd_dir=str(runtime["ccd_dir"]),
             hostname=hostname,
             assigned_ip=ip,
             route_gateway_ip=str(runtime["route_gateway_ip"]),
-            server_conf_path=str(runtime["server_conf_path"]),
+            push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
         )
 
         register_security_success(source_ip, "/enroll", hostname)
@@ -4185,12 +4383,12 @@ def apc(
             existing_client.status = "active"
             db.commit()
         ip = alloc_ip_sfos(db, client_id=existing_client.id)
-        write_ccd_entry_and_route(
+        VPN_CFG_MGR.write_ccd_entry_and_route(
             ccd_dir=CCD_SFOS,
             hostname=hostname,
             assigned_ip=ip,
             route_gateway_ip=SFOS_TUN_SERIAL_IP,
-            server_conf_path=SFOS_SERVER_CONF,
+            push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
         )
 
         username, password = upsert_client_and_credential(db, hostname, mac, ip, ts)
@@ -4311,12 +4509,12 @@ def admin_apc_request(
             existing_client.status = "active"
             db.commit()
         ip = alloc_ip_sfos(db, client_id=existing_client.id)
-        write_ccd_entry_and_route(
+        VPN_CFG_MGR.write_ccd_entry_and_route(
             ccd_dir=CCD_SFOS,
             hostname=hostname,
             assigned_ip=ip,
             route_gateway_ip=SFOS_TUN_SERIAL_IP,
-            server_conf_path=SFOS_SERVER_CONF,
+            push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
         )
 
         username, password = upsert_client_and_credential(db, hostname, mac, ip, ts, admin_password=admin_password)
@@ -4394,9 +4592,3 @@ def admin_apc_request(
             "error": f"{type(e).__name__}: {e}",
         })
         raise HTTPException(status_code=500, detail=f"failed to generate admin apc: {e}")
-
-
-
-
-
-
