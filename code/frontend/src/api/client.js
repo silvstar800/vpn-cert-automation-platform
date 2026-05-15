@@ -9,6 +9,9 @@ function buildUrl(path) {
 }
 
 async function parseResponseError(response) {
+  if (response.status === 429) {
+    return "요청이 너무 빠르게 반복되어 잠시 차단되었습니다. 잠시 후 다시 시도해 주세요.";
+  }
   const text = await response.text();
   if (!text) {
     return `Request failed: ${response.status}`;
@@ -17,6 +20,9 @@ async function parseResponseError(response) {
     const parsed = JSON.parse(text);
     return parsed.detail || parsed.message || text;
   } catch {
+    if (/<html|<body|Too Many Requests/i.test(text)) {
+      return `요청이 일시적으로 제한되었습니다. (HTTP ${response.status})`;
+    }
     return text;
   }
 }

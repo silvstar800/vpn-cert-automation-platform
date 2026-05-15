@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import {
   getAlertHistory,
   getBackupLogs,
@@ -20,6 +20,7 @@ import { formatDateTimeSeoul } from "../utils/time";
 import { deriveVpnType, vpnLabel } from "../utils/vpnLabel";
 
 const SECURITY_MONITOR_TAB_KEY = "certsvc.securityMonitor.activeTab";
+const ALERT_REFRESH_COOLDOWN_SEC = 3;
 
 const TAB_ITEMS = [
   { id: "overview", label: "개요" },
@@ -487,6 +488,10 @@ export default function SecurityMonitorPage({ clients = [] }) {
   const [alertHistory, setAlertHistory] = useState([]);
   const [alertHistoryLoading, setAlertHistoryLoading] = useState(false);
   const [alertHistoryError, setAlertHistoryError] = useState("");
+  const [alertHistoryLastUpdatedAt, setAlertHistoryLastUpdatedAt] = useState(0);
+  const [alertRefreshCooldownSec, setAlertRefreshCooldownSec] = useState(0);
+  const alertHistoryLoadingRef = useRef(false);
+  const alertHistoryLastLoadedAtRef = useRef(0);
   const [unenrollForm, setUnenrollForm] = useState(DEFAULT_UNENROLL_FORM);
   const [unenrollLoading, setUnenrollLoading] = useState(false);
   const [unenrollMessage, setUnenrollMessage] = useState("");
@@ -575,18 +580,50 @@ export default function SecurityMonitorPage({ clients = [] }) {
     }
   };
 
-  const loadAlertHistory = async () => {
+  const loadAlertHistory = async ({ force = false } = {}) => {
+    const now = Date.now();
+    if (alertHistoryLoadingRef.current) {
+      return;
+    }
+    // Avoid burst requests (e.g., chained actions calling refresh repeatedly).
+    if (!force && now - alertHistoryLastLoadedAtRef.current < 1500) {
+      return;
+    }
+    alertHistoryLoadingRef.current = true;
     setAlertHistoryLoading(true);
     setAlertHistoryError("");
     try {
       const result = await getAlertHistory();
       setAlertHistory(result.logs || []);
+      const fetchedAt = Date.now();
+      const serverUpdatedAtMs = Number(result.serverTs || 0) * 1000;
+      alertHistoryLastLoadedAtRef.current = fetchedAt;
+      setAlertHistoryLastUpdatedAt(serverUpdatedAtMs > 0 ? serverUpdatedAtMs : fetchedAt);
     } catch (err) {
       setAlertHistoryError(err.message || "알람 이력을 불러오지 못했습니다.");
     } finally {
+      alertHistoryLoadingRef.current = false;
       setAlertHistoryLoading(false);
     }
   };
+
+  const handleManualAlertRefresh = async () => {
+    if (alertHistoryLoading || alertRefreshCooldownSec > 0) {
+      return;
+    }
+    setAlertRefreshCooldownSec(ALERT_REFRESH_COOLDOWN_SEC);
+    await loadAlertHistory({ force: true });
+  };
+
+  useEffect(() => {
+    if (alertRefreshCooldownSec <= 0) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      setAlertRefreshCooldownSec((prev) => (prev <= 1 ? 0 : prev - 1));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [alertRefreshCooldownSec]);
 
   useEffect(() => {
     loadRuntimeGuardLogs();
@@ -1246,8 +1283,6 @@ export default function SecurityMonitorPage({ clients = [] }) {
       <div className="panel">
         <h3 className="panel-title">차단 해제</h3>
         {!selectedRow ? <p className="muted-text">차단 해제할 IP를 목록에서 선택해 주세요.</p> : <><div className="detail-list"><div className="detail-row"><span>선택 IP</span><strong>{selectedRow.ip}</strong></div><div className="detail-row"><span>상태</span><strong>{selectedRow.status}</strong></div><div className="detail-row"><span>최근 실패</span><strong>{selectedRow.lastFailureReason || "-"}</strong></div><div className="detail-row"><span>최근 이벤트</span><strong>{formatTs(selectedRow.lastFailureTs)}</strong></div></div><div className="field-group"><label>해제 메모</label><textarea className="input" rows="3" value={releaseNote} onChange={(e) => setReleaseNote(e.target.value)} placeholder="수동 검토 결과를 적어 주세요" /></div><div className="button-group settings-actions"><button className="primary-btn" type="button" onClick={handleUnban}>선택 IP 해제</button></div></>}
-        <div className="section-divider" />
-        {renderUnenrollFormSection()}
       </div>
     </div>
   );
@@ -1685,6 +1720,7 @@ export default function SecurityMonitorPage({ clients = [] }) {
         <div className="detail-row"><span>최근 상태</span><strong>{alertHistory[0]?.status || "-"}</strong></div>
         <div className="detail-row"><span>최근 유형</span><strong>{alertHistory[0]?.jobType || "-"}</strong></div>
         <div className="detail-row"><span>최근 시각</span><strong>{alertHistory[0] ? formatLogTime(alertHistory[0].ts) : "-"}</strong></div>
+        <div className="detail-row"><span>마지막 갱신</span><strong>{alertHistoryLastUpdatedAt ? formatDateTimeSeoul(new Date(alertHistoryLastUpdatedAt)) : "-"}</strong></div>
       </div>
     </div>
   );
@@ -2029,10 +2065,13 @@ export default function SecurityMonitorPage({ clients = [] }) {
         <div className="modal-overlay" role="presentation" onClick={() => setShowAlertLogsModal(false)}>
           <div className="modal-card logs-modal" role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()}>
             <div className="detail-header">
-              <h3 className="panel-title">알람 이력 로그</h3>
+              <div>
+                <h3 className="panel-title">알람 이력 로그</h3>
+                <p className="muted-text">마지막 갱신: {alertHistoryLastUpdatedAt ? formatDateTimeSeoul(new Date(alertHistoryLastUpdatedAt)) : "-"}</p>
+              </div>
               <div className="button-group">
-                <button className="ghost-btn compact-btn" type="button" onClick={async () => await loadAlertHistory()} disabled={alertHistoryLoading}>
-                  {alertHistoryLoading ? "불러오는 중..." : "새로고침"}
+                <button className="ghost-btn compact-btn" type="button" onClick={handleManualAlertRefresh} disabled={alertHistoryLoading || alertRefreshCooldownSec > 0}>
+                  {alertHistoryLoading ? "불러오는 중..." : (alertRefreshCooldownSec > 0 ? `새로고침 (${alertRefreshCooldownSec}초)` : "새로고침")}
                 </button>
                 <button className="ghost-btn compact-btn" type="button" onClick={() => setShowAlertLogsModal(false)}>
                   닫기

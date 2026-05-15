@@ -30,7 +30,6 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel, Field
 from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -38,8 +37,17 @@ from sqlalchemy.orm import Session
 
 import models
 from db import Base as DBBase, engine as DB_ENGINE, get_db
-from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, EquipmentAssetManager
+from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, EquipmentAssetManager, RestoreExecutionError
 from managers.security_manager import RateLimitExceeded
+from schemas import (
+    EnrollPayload, EnrollApcPayload, AdminApcPayload,
+    SecuritySettingsPayload, SecurityUnbanPayload, SecurityUnenrollPayload,
+    DebugAccessPayload, WebLoginPayload,
+    BackupSettingsPayload, BackupRunPayload, RestoreBrowsePayload, RestoreRunPayload,
+    SlackSettingsPayload, SlackTestPayload,
+    InventorySyncPayload, InventorySyncTriggerPayload,
+    EquipmentAssetManualCreatePayload,
+)
 from utils.cert_utils import get_certificate_expire_at as get_certificate_expire_at_util
 from utils.network_utils import canonical_ip as canonical_ip_util
 from utils.time_utils import (
@@ -244,7 +252,7 @@ VPN_CFG_MGR = VPNConfigManager(
 )
 
 # Initialize BackupManager
-BACKUP_MGR = BackupManager(backup_base_dir=BACKUP_BASE_DIR)
+BACKUP_MGR = BackupManager(backup_base_dir=BACKUP_BASE_DIR, cipher_secret=BACKUP_CONFIG_SECRET)
 
 # Initialize AlertManager
 ALERT_MGR = AlertManager(
@@ -321,135 +329,6 @@ async def add_security_headers(request: Request, call_next):
         response.headers.setdefault("Pragma", "no-cache")
     return response
 
-
-class EnrollPayload(BaseModel):
-    hostname: str = Field(min_length=1, max_length=128)
-    timestamp: int
-    signature: str = Field(min_length=16, max_length=256)
-    mac: str | None = Field(default="", max_length=32)
-    serialNumber: str | None = Field(default="", max_length=64)
-    deviceModel: str | None = Field(default="", max_length=128)
-    selectedVpnPort: int | None = None
-    opensslVersion: str | None = Field(default="", max_length=64)
-
-
-class EnrollApcPayload(BaseModel):
-    hostname: str = Field(min_length=1, max_length=128)
-    mac: str | None = Field(default="", max_length=32)
-    serialNumber: str | None = Field(default="", max_length=64)
-    deviceModel: str | None = Field(default="", max_length=128)
-    timestamp: int
-    signature: str = Field(min_length=16, max_length=256)
-
-
-class AdminApcPayload(BaseModel):
-    hostname: str = Field(min_length=1, max_length=128)
-    mac: str | None = Field(default="", max_length=32)
-    serialNumber: str | None = Field(default="", max_length=64)
-    deviceModel: str | None = Field(default="", max_length=128)
-    adminPassword: str = Field(min_length=1, max_length=256)
-
-
-class SecuritySettingsPayload(BaseModel):
-    alertThreshold: int
-    banThreshold: int
-    windowSeconds: int
-
-
-class SecurityUnbanPayload(BaseModel):
-    ip: str = Field(min_length=1, max_length=64)
-    note: str | None = Field(default="", max_length=500)
-
-
-class SecurityUnenrollPayload(BaseModel):
-    hostname: str = Field(min_length=1, max_length=128)
-    vpnType: str = Field(min_length=1, max_length=32)
-    note: str | None = Field(default="", max_length=500)
-
-
-class DebugAccessPayload(BaseModel):
-    password: str = Field(min_length=1, max_length=256)
-
-
-class WebLoginPayload(BaseModel):
-    username: str = Field(min_length=1, max_length=64)
-    password: str = Field(min_length=1, max_length=256)
-
-
-class BackupSettingsPayload(BaseModel):
-    ftpHost: str = Field(min_length=1, max_length=256)
-    ftpUsername: str = Field(min_length=1, max_length=256)
-    ftpPassword: str | None = Field(default="", max_length=256)
-    ftpRemotePath: str = Field(min_length=1, max_length=512)
-    scheduleType: str = Field(min_length=1, max_length=16)
-    scheduleTime: str | None = Field(default="", max_length=8)
-    scheduleWeekday: int | None = None
-    scheduleMonthday: int | None = None
-    passwordChanged: bool = False
-
-
-class BackupRunPayload(BaseModel):
-    note: str | None = Field(default="", max_length=500)
-
-
-class RestoreBrowsePayload(BaseModel):
-    ftpHost: str = Field(min_length=1, max_length=256)
-    ftpUsername: str = Field(min_length=1, max_length=256)
-    ftpPassword: str = Field(min_length=1, max_length=256)
-    ftpRemotePath: str | None = Field(default="/", max_length=512)
-
-
-class RestoreRunPayload(BaseModel):
-    ftpHost: str = Field(min_length=1, max_length=256)
-    ftpUsername: str = Field(min_length=1, max_length=256)
-    ftpPassword: str = Field(min_length=1, max_length=256)
-    ftpRemotePath: str | None = Field(default="/", max_length=512)
-    backupId: str = Field(min_length=1, max_length=128)
-    mode: str = Field(default="validate", max_length=16)
-
-
-class SlackSettingsPayload(BaseModel):
-    enabled: bool = False
-    botToken: str | None = Field(default="", max_length=256)
-    channel: str = Field(default="#01-alert", max_length=128)
-    notifyCertificateExpiry: bool = True
-    notifyBackupCompleted: bool = True
-    notifySecurityAlert: bool = True
-    notifyServiceDown: bool = True
-    notifyResourceThreshold: bool = True
-    cpuThreshold: int = 90
-    memoryThreshold: int = 90
-    diskThreshold: int = 90
-    tokenChanged: bool = False
-
-
-class SlackTestPayload(BaseModel):
-    templateType: str = Field(min_length=1, max_length=64)
-
-
-class InventorySyncPayload(BaseModel):
-    serialNumber: str | None = Field(default="", max_length=64)
-    hostname: str | None = Field(default="", max_length=128)
-    assignedIp: str | None = Field(default="", max_length=64)
-    vpnType: str | None = Field(default="", max_length=32)
-    customerName: str | None = Field(default="", max_length=256)
-    customerSyncStatus: int | None = None
-    assetStatus: int | str | None = None
-    saleType: int | str | None = None
-    deviceModel: str | None = Field(default="", max_length=128)
-    licenseInfo: dict | None = None
-
-    model_config = {"extra": "allow"}
-
-
-class InventorySyncTriggerPayload(BaseModel):
-    serialNumber: str | None = Field(default="", max_length=64)
-    hostname: str | None = Field(default="", max_length=128)
-
-
-class EquipmentAssetManualCreatePayload(BaseModel):
-    serialNumber: str = Field(min_length=1, max_length=64)
-    deviceModel: str = Field(min_length=1, max_length=128)
 
 
 def load_template_text(template_path: Path) -> str:
@@ -671,6 +550,7 @@ def render_vpn_enroll_script(default_hostname: str = "", request: Request | None
             "__LEGACY_VPN_PORT__": str(OPENVPN_LEGACY_PORT),
             "__BACKUP_KEY_ID__": BACKUP_UPLOAD_HMAC_KEY_ID,
             "__DEFAULT_HOSTNAME__": host_for_script,
+            "__IPT_FILE__": "/var/mdw/etc/iptables/iptable.filter",
         },
     )
 
@@ -849,55 +729,21 @@ def hash_stored_secret(secret_value: str) -> str:
 
 def derive_backup_cipher_key() -> bytes:
     """Derive a stable symmetric key for backup setting encryption."""
-    if not BACKUP_CONFIG_SECRET:
-        raise RuntimeError("BACKUP_CONFIG_SECRET must not be empty")
-    return hashlib.sha256(BACKUP_CONFIG_SECRET.encode("utf-8")).digest()
+    return BACKUP_MGR.derive_backup_cipher_key()
 
 
 def _xor_stream(data: bytes, key: bytes, nonce: bytes) -> bytes:
-    chunks = []
-    counter = 0
-    offset = 0
-    while offset < len(data):
-        block = hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest()
-        counter += 1
-        part = data[offset : offset + len(block)]
-        chunks.append(bytes(a ^ b for a, b in zip(part, block)))
-        offset += len(block)
-    return b"".join(chunks)
+    return BACKUP_MGR._xor_stream(data, key, nonce)
 
 
 def encrypt_backup_secret(secret_value: str) -> str:
     """Encrypt backup-related secrets before persisting them in the DB."""
-    if not secret_value:
-        return ""
-    key = derive_backup_cipher_key()
-    nonce = secrets.token_bytes(16)
-    plaintext = secret_value.encode("utf-8")
-    ciphertext = _xor_stream(plaintext, key, nonce)
-    mac = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()
-    token = base64.urlsafe_b64encode(nonce + ciphertext + mac).decode("ascii")
-    return f"enc1${token}"
+    return BACKUP_MGR.encrypt_backup_secret(secret_value)
 
 
 def decrypt_backup_secret(encrypted_value: str) -> str:
     """Decrypt backup-related secrets stored by encrypt_backup_secret."""
-    if not encrypted_value:
-        return ""
-    if not encrypted_value.startswith("enc1$"):
-        return encrypted_value
-    raw = base64.urlsafe_b64decode(encrypted_value.split("$", 1)[1].encode("ascii"))
-    if len(raw) < 48:
-        raise ValueError("invalid encrypted backup secret")
-    nonce = raw[:16]
-    mac = raw[-32:]
-    ciphertext = raw[16:-32]
-    key = derive_backup_cipher_key()
-    expected = hmac.new(key, nonce + ciphertext, hashlib.sha256).digest()
-    if not hmac.compare_digest(mac, expected):
-        raise ValueError("backup secret integrity check failed")
-    plaintext = _xor_stream(ciphertext, key, nonce)
-    return plaintext.decode("utf-8")
+    return BACKUP_MGR.decrypt_backup_secret(encrypted_value)
 
 
 def ensure_backup_schema() -> None:
@@ -1768,14 +1614,6 @@ def safe_extract_archive(archive_path: Path, target_dir: Path) -> None:
     BACKUP_MGR.safe_extract_archive(archive_path, target_dir)
 
 
-class RestoreExecutionError(RuntimeError):
-    """Raised when restore execution fails after partial stage progress."""
-
-    def __init__(self, message: str, payload: dict | None = None):
-        super().__init__(message)
-        self.payload = payload or {}
-
-
 def append_restore_stage(stages: list[dict], name: str, status: str, detail: str) -> dict:
     """Append a restore stage entry in a UI-friendly shape."""
     return BACKUP_MGR.append_restore_stage(stages, name, status, detail)
@@ -1886,101 +1724,23 @@ def build_restore_preflight_summary(bundle_dir: Path | None, validation: dict | 
 
 
 def apply_restored_backup_bundle(bundle_dir: Path) -> dict:
-    """Apply a downloaded backup bundle to the current server."""
-    stages = []
-    restore_point = None
-
-    stopped_services = [
-        "nginx.service",
-        "certsvc.service",
-        "openvpn-server@server.service",
-        "openvpn-server@server-legacy.service",
-        "openvpn-server@server-sfos.service",
-    ]
-    restarted_services = []
-    try:
-        restore_point = create_restore_point_bundle()
-        append_restore_stage(stages, "복구 전 자동 백업 생성", "success", str(restore_point))
-
-        for service in stopped_services:
-            ok, detail = run_systemctl_action(service, "stop")
-            append_restore_stage(stages, f"{service} 중지", "success" if ok else "failed", detail)
-            if not ok:
-                raise RestoreExecutionError(
-                    f"{service} 중지 실패",
-                    {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
-                )
-
-        db_dump_path = bundle_dir / "db.dump"
-        restore_command, restore_env = build_pg_restore_command(os.environ["DATABASE_URL"], db_dump_path)
-        subprocess.run(restore_command, check=True, capture_output=True, text=True, env=restore_env)
-        append_restore_stage(stages, "DB 복구", "success", str(db_dump_path))
-
-        archive_map = [
-            ("pki.tar.gz", Path("/etc/openvpn")),
-            ("ccd.tar.gz", Path("/etc/openvpn")),
-            ("ccd_legacy.tar.gz", Path("/etc/openvpn")),
-            ("ccd_sfos.tar.gz", Path("/etc/openvpn")),
-            ("openvpn_conf.tar.gz", Path("/etc/openvpn")),
-            ("ui.tar.gz", APP_ROOT_DIR),
-        ]
-        for archive_name, target_dir in archive_map:
-            archive_path = bundle_dir / archive_name
-            if archive_path.exists():
-                safe_extract_archive(archive_path, target_dir)
-                append_restore_stage(stages, f"{archive_name} 적용", "success", f"{archive_path} -> {target_dir}")
-            else:
-                append_restore_stage(stages, f"{archive_name} 적용", "skipped", "백업본에 파일이 없어 건너뜀")
-
-        env_archive = bundle_dir / "env.tar.gz"
-        if env_archive.exists():
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_root = Path(tmpdir)
-                safe_extract_archive(env_archive, tmp_root)
-                extracted_env = tmp_root / ".env"
-                if extracted_env.exists():
-                    shutil.copy2(extracted_env, APP_ENV_FILE)
-                    append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "success", APP_ENV_FILE)
-                else:
-                    append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "failed", "env.tar.gz 내부에 .env 파일이 없습니다.")
-                    raise RestoreExecutionError(
-                        "env.tar.gz 내부에 .env 파일이 없습니다.",
-                        {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
-                    )
-        else:
-            append_restore_stage(stages, "애플리케이션 설정(.env) 적용", "skipped", "백업본에 env.tar.gz가 없어 건너뜀")
-    except RestoreExecutionError:
-        raise
-    except Exception as exc:
-        append_restore_stage(stages, "복구 적용", "failed", f"{type(exc).__name__}: {exc}")
-        raise RestoreExecutionError(
-            f"복구 적용 중 실패: {type(exc).__name__}: {exc}",
-            {"restorePoint": str(restore_point) if restore_point else "", "stages": stages, "restartedServices": restarted_services},
-        ) from exc
-    finally:
-        for service in [
-            "openvpn-server@server.service",
-            "openvpn-server@server-legacy.service",
-            "openvpn-server@server-sfos.service",
-            "certsvc.service",
-            "nginx.service",
-        ]:
-            ok, detail = run_systemctl_action(service, "start")
-            append_restore_stage(stages, f"{service} 시작", "success" if ok else "failed", detail)
-            restarted_services.append(service)
-
-    service_checklist = build_restore_service_checklist()
-    return {
-        "restorePoint": str(restore_point) if restore_point else "",
-        "restartedServices": restarted_services,
-        "stages": stages,
-        "serviceChecklist": service_checklist,
-        "serviceChecklistOk": all(item.get("ok") for item in service_checklist),
-    }
+    """Apply a downloaded backup bundle using BackupManager orchestration."""
+    return BACKUP_MGR.apply_restored_backup_bundle(
+        bundle_dir=bundle_dir,
+        pki_dir=PKI,
+        ccd_dir=CCD,
+        ccd_legacy_dir=CCD_LEGACY,
+        ccd_sfos_dir=CCD_SFOS,
+        openvpn_conf_path=OPENVPN_CONF,
+        app_root_dir=str(APP_ROOT_DIR),
+        app_env_file=APP_ENV_FILE,
+        database_url=os.environ["DATABASE_URL"],
+        service_checklist_fn=build_restore_service_checklist,
+    )
 
 
 def run_restore_job(db: Session, data: RestoreRunPayload) -> dict:
-    """Download a selected backup from FTP and validate or restore it."""
+    """Application-level restore orchestration: download, validate, and optionally apply."""
     host = (data.ftpHost or "").strip()
     username = (data.ftpUsername or "").strip()
     password = (data.ftpPassword or "").strip()
@@ -2125,74 +1885,21 @@ def create_backup_bundle(record: models.BackupSetting) -> tuple[Path, dict]:
 
 
 def run_backup_job(db: Session, record: models.BackupSetting, trigger: str = "manual") -> dict:
-    """Create and upload a backup bundle using current persisted settings."""
+    """Application-level backup orchestration: create bundle, upload, log, and notify."""
     host = (record.ftp_host or "").strip()
     username = (record.ftp_username or "").strip()
-    remote_path = (record.ftp_remote_path or "").strip() or "/"
     if not host or not username or not record.ftp_password_enc:
         raise HTTPException(status_code=400, detail="backup settings are incomplete")
-    password = decrypt_backup_secret(record.ftp_password_enc)
-    bundle_dir: Path | None = None
-    manifest: dict = {}
-    uploaded: list[str] = []
-    validation: dict = {}
-    try:
-        bundle_dir, manifest = create_backup_bundle(record)
-        validation = build_local_backup_validation(bundle_dir)
-        append_backup_log(
-            db,
-            record,
-            job_type="backup_verify",
-            status="success" if validation.get("valid") else "failed",
-            trigger=trigger,
-            message="백업 자동 검증 완료" if validation.get("valid") else "백업 자동 검증 실패",
-            detail=json.dumps(validation, ensure_ascii=False, indent=2),
-        )
-        if not validation.get("valid"):
-            raise RuntimeError(f"backup verification failed: {validation.get('missingFiles', [])}")
-
-        ftp = ftp_connect(host, username, password)
-        try:
-            remote_dir = f"{remote_path.rstrip('/')}/{bundle_dir.name}" if remote_path.strip() else f"/{bundle_dir.name}"
-            uploaded = upload_dir_via_ftp(ftp, bundle_dir, remote_dir)
-        finally:
-            try:
-                ftp.quit()
-            except FTP_ERRORS:
-                ftp.close()
-    except BACKUP_IO_ERROR_TYPES as exc:
-        append_backup_log(
-            db,
-            record,
-            job_type="backup",
-            status="failed",
-            trigger=trigger,
-            message="백업 실행 실패",
-            detail=f"{type(exc).__name__}: {exc}",
-        )
-        raise
-    finally:
-        # FTP 업로드 완료(성공/실패 무관)후 로컬 번들 정리: 최근 5개만 유지
-        try:
-            root = Path(BACKUP_BASE_DIR)
-            bundles = sorted(root.glob("backup_*"), key=lambda p: p.name, reverse=True)
-            for old_bundle in bundles[5:]:
-                shutil.rmtree(old_bundle, ignore_errors=True)
-        except OSError:
-            LOGGER.exception("failed to clean old backup bundles")
-
-    log_entry = append_backup_log(
+    return BACKUP_MGR.run_backup_job(
         db,
         record,
-        job_type="backup",
-        status="success",
+        create_bundle_fn=create_backup_bundle,
+        validation_fn=build_local_backup_validation,
+        append_log_fn=append_backup_log,
+        notify_backup_completed_fn=lambda target_record: try_send_configured_slack_message(target_record, "backup_completed"),
         trigger=trigger,
-        message=f"백업 실행 완료 ({bundle_dir.name})",
-        detail=json.dumps({"backupId": bundle_dir.name, "uploaded": uploaded, "manifest": manifest, "validation": validation}, ensure_ascii=False, indent=2),
+        io_error_types=BACKUP_IO_ERROR_TYPES,
     )
-    if record.slack_notify_backup_completed:
-        try_send_configured_slack_message(record, "backup_completed")
-    return {"backupId": bundle_dir.name, "uploaded": uploaded, "manifest": manifest, "validation": validation, "log": log_entry}
 
 
 def run_backup_test_connection(settings: BackupSettingsPayload) -> dict:
@@ -2203,16 +1910,7 @@ def run_backup_test_connection(settings: BackupSettingsPayload) -> dict:
     remote_path = (settings.ftpRemotePath or "").strip() or "/"
     if not host or not username or not password:
         raise HTTPException(status_code=400, detail="ftp host, username, and password are required")
-    ftp = ftp_connect(host, username, password)
-    try:
-        resolved = ensure_ftp_remote_dir(ftp, remote_path)
-        listing = ftp.nlst()[:10]
-    finally:
-        try:
-            ftp.quit()
-        except FTP_ERRORS:
-            ftp.close()
-    return {"ok": True, "remotePath": resolved, "sample": listing}
+    return BACKUP_MGR.test_ftp_connection(host, username, password, remote_path)
 
 
 def build_schedule_run_key(record: models.BackupSetting, now_local: datetime) -> str:
@@ -2226,7 +1924,7 @@ def should_run_scheduled_backup(record: models.BackupSetting, now_local: datetim
 
 
 def backup_scheduler_loop() -> None:
-    """Poll persisted settings and run scheduled backups when due."""
+    """Application-level scheduler loop coordinating DB state and backup execution."""
     while True:
         scheduled_run_key = "-"
         try:
@@ -2775,7 +2473,14 @@ def ensure_client_material(hostname: str):
     return ca_pem, crt_pem, key_pem
 
 
-def write_openvpn_bundle(hostname: str, ca_cert: str, certificate: str, key: str, vpn_port: int | None = None) -> str:
+def write_openvpn_bundle(
+    hostname: str,
+    ca_cert: str,
+    certificate: str,
+    key: str,
+    vpn_port: int | None = None,
+    api_port: int | None = None,
+) -> str:
     """Build and archive deployable OpenVPN client bundle."""
     return VPN_CFG_MGR.write_openvpn_bundle(
         hostname,
@@ -2787,6 +2492,7 @@ def write_openvpn_bundle(hostname: str, ca_cert: str, certificate: str, key: str
         vpn_port=vpn_port,
         pki_dir=PKI,
         templates_dir=str(TEMPLATES_DIR),
+        api_port=api_port,
     )
 
 
@@ -2818,7 +2524,7 @@ def collect_runtime_service_statuses() -> list[dict]:
 
 
 def alert_monitor_loop() -> None:
-    """Poll runtime status and send operational Slack alerts on state transitions."""
+    """Application-level monitor loop coordinating runtime checks and alert delivery."""
     while True:
         try:
             with Session(DB_ENGINE) as db:
@@ -2864,6 +2570,7 @@ def upsert_client_and_credential(
     ip: str,
     ts: int,
     admin_password: str | None = None,
+    auto_commit: bool = True,
 ):
     """Create or update SFOS client and credential records.
 
@@ -2884,13 +2591,13 @@ def upsert_client_and_credential(
             status="active",
         )
         db.add(client)
-        db.commit()
+        db.flush()
         db.refresh(client)
     else:
         client.mac = mac
         client.cert_cn = hostname
         client.status = "active"
-        db.commit()
+        db.flush()
 
     sync_ip_lease_binding(db, client=client, assigned_ip=ip)
 
@@ -2906,7 +2613,7 @@ def upsert_client_and_credential(
             sfos_admin_password_enc=encrypt_backup_secret(manual_password) if manual_password else "",
         )
         db.add(cred)
-        db.commit()
+        db.flush()
     elif cred.password.startswith("enc1$"):
         # 기존 암호화 패스워드 재사용, 관리자 지정 패스워드가 있으면 교체
         password = decrypt_backup_secret(cred.password)
@@ -2917,13 +2624,16 @@ def upsert_client_and_credential(
             cred.sfos_admin_password_enc = encrypt_backup_secret(manual_password)
         if cred.username != username:
             cred.username = username
-        db.commit()
+        db.flush()
     else:
         # 구 sha256$ 해시 포맷은 복호화 불가이므로 관리자 지정값 또는 신규값으로 rotate
         password = manual_password or make_sfos_password()
         cred.username = username
         cred.password = encrypt_backup_secret(password)
         cred.sfos_admin_password_enc = encrypt_backup_secret(manual_password) if manual_password else ""
+        db.flush()
+
+    if auto_commit:
         db.commit()
 
     return username, password
@@ -3161,11 +2871,93 @@ def receive_equipment_sync_callback(
         return {"ok": True, "asset": serialize_equipment_asset(asset)}
     except ValueError as exc:
         db.rollback()
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        message = str(exc)
+        if "required" in message.lower():
+            raise HTTPException(status_code=400, detail=message) from exc
+        raise HTTPException(status_code=404, detail=message) from exc
     except (IntegrityError, RuntimeError, TypeError, KeyError, OSError) as exc:
         db.rollback()
         LOGGER.exception("inventory sync callback failed")
         raise HTTPException(status_code=500, detail=f"inventory sync callback failed: {exc}") from exc
+
+
+def resolve_inventory_sync_target(
+    db: Session,
+    *,
+    serial_number: str = "",
+) -> tuple[models.EquipmentAsset, models.Client | None, str]:
+    """Resolve an equipment asset and its linked client/IP by serial number only."""
+    client = None
+
+    normalized_serial = normalize_serial_number(serial_number) if (serial_number or "").strip() else ""
+    if not normalized_serial:
+        raise HTTPException(status_code=400, detail="serialNumber is required")
+
+    asset = db.query(models.EquipmentAsset).filter_by(serial_number=normalized_serial).first()
+    if asset is None:
+        raise HTTPException(status_code=404, detail=f"equipment asset not found for serial: {normalized_serial}")
+
+    if client is None and asset.client_id:
+        client = db.query(models.Client).filter_by(id=asset.client_id).first()
+
+    assigned_ip = ""
+    if client is not None:
+        lease = db.query(models.IPLease).filter_by(client_id=client.id).first()
+        assigned_ip = canonical_ip_util(lease.assigned_ip) if lease and lease.assigned_ip else ""
+    return asset, client, assigned_ip
+
+
+@app.post("/equipment-assets/sync/listener")
+def listen_equipment_sync_request(
+    data: InventorySyncPayload,
+    _: None = Depends(require_inventory_sync_token),
+    db: Session = Depends(get_db),
+):
+    """Mock listener for future external inventory sync integration.
+
+    It accepts the current outbound payload shape and returns a normalized
+    response payload without mutating the DB. This allows end-to-end testing
+    before the real vendor/customer API is available.
+    """
+    request_payload = data.model_dump(exclude_none=True)
+    asset, client, assigned_ip = resolve_inventory_sync_target(
+        db,
+        serial_number=data.serialNumber or "",
+    )
+
+    response_payload = {
+        "serialNumber": asset.serial_number,
+        "hostname": (client.hostname if client else data.hostname) or "",
+        "assignedIp": assigned_ip,
+        "vpnType": (client.vpn_type if client else data.vpnType) or "",
+        "customerName": asset.customer_name or data.customerName or "연동 대기 고객사",
+        "customerSyncStatus": int(asset.customer_sync_status or 0),
+        "assetStatus": int(asset.asset_status or 0),
+        "saleType": int(asset.sale_type or 0),
+        "deviceModel": asset.device_model or data.deviceModel or "",
+        "licenseInfo": build_inventory_license_info(client),
+        "expireAt": get_certificate_expire_at_util(
+            (client.cert_cn if client and client.cert_cn else (client.hostname if client else "")) or "",
+            client.created_at if client else asset.created_at,
+            pki_dir=PKI,
+        ) if client else "",
+        "registeredAt": format_display_datetime_util(
+            client.created_at if client else asset.created_at,
+            DISPLAY_TIMEZONE,
+        ),
+        "note": "inventory sync mock listener response",
+    }
+
+    append_inventory_sync_log(
+        {
+            "event": "inventory-sync-listener-request",
+            "mode": "listener",
+            "payload": request_payload,
+            "response": response_payload,
+        },
+        feature="inventory-sync",
+    )
+    return {"ok": True, "mode": "listener", "response": response_payload}
 
 
 @app.post("/equipment-assets/sync/trigger")
@@ -3174,26 +2966,11 @@ def trigger_equipment_asset_sync(
     _: dict | None = Depends(require_web_or_internal_access),
     db: Session = Depends(get_db),
 ):
-    """Manually trigger outbound inventory sync for a specific asset by serial or hostname."""
-    serial_number = normalize_serial_number(data.serialNumber or "") if (data.serialNumber or "").strip() else ""
-    hostname = normalize_hostname(data.hostname) if (data.hostname or "").strip() else ""
-
-    asset = None
-    client = None
-    if serial_number:
-        asset = db.query(models.EquipmentAsset).filter_by(serial_number=serial_number).first()
-    if asset is None and hostname:
-        client = db.query(models.Client).filter_by(hostname=hostname).first()
-        if client is not None:
-            asset = db.query(models.EquipmentAsset).filter_by(client_id=client.id).first()
-    if asset is None:
-        raise HTTPException(status_code=404, detail="matching equipment asset not found")
-    if client is None and asset.client_id:
-        client = db.query(models.Client).filter_by(id=asset.client_id).first()
-    assigned_ip = ""
-    if client is not None:
-        lease = db.query(models.IPLease).filter_by(client_id=client.id).first()
-        assigned_ip = canonical_ip_util(lease.assigned_ip) if lease and lease.assigned_ip else ""
+    """Manually trigger outbound inventory sync for a specific asset by serial."""
+    asset, client, assigned_ip = resolve_inventory_sync_target(
+        db,
+        serial_number=data.serialNumber or "",
+    )
 
     result = try_send_inventory_sync(
         db,
@@ -3620,7 +3397,10 @@ def get_alert_history(
     """Return recent alert/notification history."""
     record = get_backup_settings_record(db)
     logs = [entry for entry in reversed(parse_job_logs(record)) if is_alert_log_entry(entry)]
-    return {"logs": logs[:200]}
+    return {
+        "logs": logs[:200],
+        "serverTs": int(datetime.now(tz=timezone.utc).timestamp()),
+    }
 
 
 @app.get("/backup/settings")
@@ -4248,7 +4028,15 @@ def enroll(request: Request, data: EnrollPayload, db: Session = Depends(get_db))
         ip = alloc_ip_openvpn(db, is_legacy=is_legacy_client, client_id=client.id)
 
         ca_cert, certificate, key = ensure_client_material(hostname)
-        archive_path, tmp_root_dir = write_openvpn_bundle(hostname, ca_cert, certificate, key, vpn_port=int(runtime["vpn_port"]))
+        _, _, script_server_port = resolve_enroll_script_target(request)
+        archive_path, tmp_root_dir = write_openvpn_bundle(
+            hostname,
+            ca_cert,
+            certificate,
+            key,
+            vpn_port=int(runtime["vpn_port"]),
+            api_port=int(script_server_port),
+        )
         sync_ip_lease_binding(db, client=client, assigned_ip=ip)
         if serial_number:
             asset = upsert_equipment_asset(
@@ -4375,13 +4163,13 @@ def apc(
                 status="active",
             )
             db.add(existing_client)
-            db.commit()
+            db.flush()
             db.refresh(existing_client)
         else:
             existing_client.mac = mac
             existing_client.cert_cn = hostname
             existing_client.status = "active"
-            db.commit()
+            db.flush()
         ip = alloc_ip_sfos(db, client_id=existing_client.id)
         VPN_CFG_MGR.write_ccd_entry_and_route(
             ccd_dir=CCD_SFOS,
@@ -4391,7 +4179,7 @@ def apc(
             push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
         )
 
-        username, password = upsert_client_and_credential(db, hostname, mac, ip, ts)
+        username, password = upsert_client_and_credential(db, hostname, mac, ip, ts, auto_commit=False)
         ca_cert, certificate, key = ensure_client_material(hostname)
         if serial_number:
             asset = upsert_equipment_asset(
@@ -4404,7 +4192,7 @@ def apc(
                 event_detail=f"{hostname} 장비의 APC 등록 시 시리얼 {serial_number} / 모델 {device_model or '-'} 정보가 반영되었습니다.",
                 created_by="apc-enroll",
             )
-            db.commit()
+            db.flush()
             if asset is not None:
                 try_send_inventory_sync(
                     db,
@@ -4413,6 +4201,8 @@ def apc(
                     assigned_ip=ip,
                     trigger="apc-enroll",
                 )
+
+        db.commit()
 
         apc_obj = {
             "username": username,
@@ -4501,13 +4291,13 @@ def admin_apc_request(
                 status="active",
             )
             db.add(existing_client)
-            db.commit()
+            db.flush()
             db.refresh(existing_client)
         else:
             existing_client.mac = mac
             existing_client.cert_cn = hostname
             existing_client.status = "active"
-            db.commit()
+            db.flush()
         ip = alloc_ip_sfos(db, client_id=existing_client.id)
         VPN_CFG_MGR.write_ccd_entry_and_route(
             ccd_dir=CCD_SFOS,
@@ -4517,7 +4307,15 @@ def admin_apc_request(
             push_remote_network=OPENVPN_PUSH_REMOTE_NETWORK_1,
         )
 
-        username, password = upsert_client_and_credential(db, hostname, mac, ip, ts, admin_password=admin_password)
+        username, password = upsert_client_and_credential(
+            db,
+            hostname,
+            mac,
+            ip,
+            ts,
+            admin_password=admin_password,
+            auto_commit=False,
+        )
         ca_cert, certificate, key = ensure_client_material(hostname)
         if serial_number:
             asset = upsert_equipment_asset(
@@ -4530,7 +4328,7 @@ def admin_apc_request(
                 event_detail=f"관리자 APC 생성 요청에서 시리얼 {serial_number} / 모델 {device_model or '-'} 정보가 반영되었습니다.",
                 created_by="admin-apc",
             )
-            db.commit()
+            db.flush()
             if asset is not None:
                 try_send_inventory_sync(
                     db,
@@ -4539,6 +4337,8 @@ def admin_apc_request(
                     assigned_ip=ip,
                     trigger="admin-apc",
                 )
+
+        db.commit()
         apc_obj = {
             "username": username,
             "password": password,

@@ -349,6 +349,7 @@ class VPNConfigManager:
         vpn_port: int | None = None,
         pki_dir: str,
         templates_dir: str,
+        api_port: int | None = None,
     ) -> tuple[str, Path]:
         """Build and archive deployable OpenVPN client bundle."""
         client_conf = (
@@ -387,7 +388,19 @@ class VPNConfigManager:
                     continue
                 dest = base_dir / src.name
                 if src.is_file():
-                    shutil.copy2(src, dest)
+                    # For shell scripts, render placeholders
+                    if src.suffix == ".sh":
+                        content = src.read_text(encoding="utf-8")
+                        content = content.replace("__FW_GUARD__", "/usr/local/sbin/certsvc-ensure-fw.sh")
+                        content = content.replace("__SERVER_IP__", server_ip)
+                        content = content.replace("__VPN_PORT__", str(int(vpn_port or default_port)))
+                        if api_port:
+                            content = content.replace("__SERVER_API_PORT__", str(api_port))
+                        content = content.replace("__IPT_FILE__", "/var/mdw/etc/iptables/iptable.filter")
+                        dest.write_text(content, encoding="utf-8")
+                        dest.chmod(0o755)
+                    else:
+                        shutil.copy2(src, dest)
                 elif src.is_dir():
                     shutil.copytree(src, dest, dirs_exist_ok=True)
 

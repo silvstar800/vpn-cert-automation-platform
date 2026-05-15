@@ -788,6 +788,48 @@ select {
   font-weight: 700;
 }
 
+.asset-history-detail-groups {
+  display: grid;
+  gap: 10px;
+}
+
+.asset-history-detail-group {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.asset-history-detail-title {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--muted);
+}
+
+.asset-history-detail-fields {
+  display: grid;
+  gap: 6px;
+}
+
+.asset-history-detail-field {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.asset-history-detail-field span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.asset-history-detail-field strong {
+  line-height: 1.45;
+  word-break: break-word;
+}
+
 .security-unlock-panel {
   width: min(760px, 100%);
   max-width: 760px;
