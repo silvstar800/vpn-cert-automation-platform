@@ -1,8 +1,33 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.so
+.pytest_cache/
+
+# Frontend / package artifacts
 node_modules/
 dist/
+code/frontend/node_modules/
+code/frontend/dist/
+
+# Portfolio work/output artifacts
 docs/ppt_work/node_modules/
 docs/ppt_work/output/
 docs/ppt_work/scratch/
 docs/~$*.docx
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime / logs
+*.log
+*.bak
+*.tmp
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
