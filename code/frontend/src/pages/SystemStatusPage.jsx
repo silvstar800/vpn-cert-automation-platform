@@ -10,6 +10,12 @@ function formatGb(value) {
   return Number.isFinite(number) ? `${number.toFixed(1)} GB` : "-";
 }
 
+function serviceBadgeMeta(status) {
+  return status === "running"
+    ? { tone: "normal", label: "정상" }
+    : { tone: "stopped", label: "중지" };
+}
+
 export default function SystemStatusPage({ services = [], resources = null }) {
   const cpu = resources?.cpu || {};
   const memory = resources?.memory || {};
@@ -21,15 +27,18 @@ export default function SystemStatusPage({ services = [], resources = null }) {
         <div className="panel">
           <h3 className="panel-title">서비스 상태</h3>
           <div className="list-wrap">
-            {services.map((service) => (
-              <div key={service.name} className="list-row">
-                <div>
-                  <div className="row-title">{service.name}</div>
-                  <div className="row-sub">{service.port}</div>
+            {services.map((service) => {
+              const badge = serviceBadgeMeta(service.status);
+              return (
+                <div key={service.name} className="list-row">
+                  <div>
+                    <div className="row-title">{service.name}</div>
+                    <div className="row-sub">{service.port}</div>
+                  </div>
+                  <StatusBadge tone={badge.tone} label={badge.label} />
                 </div>
-                <StatusBadge status={service.status} />
-              </div>
-            ))}
+              );
+            })}
             {!services.length ? <div className="muted-text">표시할 서비스 상태가 없습니다.</div> : null}
           </div>
         </div>

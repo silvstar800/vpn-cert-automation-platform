@@ -1,5 +1,10 @@
-﻿import { useEffect, useMemo, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { formatDateSeoul, formatDateTimeSeoul } from "../utils/time";
+import {
+  createEquipmentAssetManual,
+  downloadEquipmentAssetsTemplate,
+  importEquipmentAssetsExcel,
+} from "../api/client";
 
 const STORAGE_KEYS = {
   search: "certsvc.assets.search",
@@ -46,12 +51,118 @@ function AssetStatusBadge({ label }) {
   return <span className={`status-badge ${statusClass}`}>{label || "-"}</span>;
 }
 
-export default function AssetsPage({ assets = [] }) {
+function parseHistoryJson(detail) {
+  if (!detail || typeof detail !== "string") return null;
+  const trimmed = detail.trim();
+  if (!trimmed.startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatInlineField(label, value) {
+  if (value === undefined || value === null || value === "") return "";
+  return `${label} ${value}`;
+}
+
+function summarizeCustomerSyncDetail(detail) {
+  const parsed = parseHistoryJson(detail);
+  if (!parsed) return null;
+
+  const payload = parsed.payload && typeof parsed.payload === "object" ? parsed.payload : {};
+  const mockResponse = parsed.mockResponse && typeof parsed.mockResponse === "object" ? parsed.mockResponse : {};
+  const licenseInfo = payload.licenseInfo && typeof payload.licenseInfo === "object" ? payload.licenseInfo : {};
+
+  const groups = [
+    {
+      title: "요청 정보",
+      fields: [
+        { label: "시리얼", value: payload.serialNumber },
+        { label: "호스트", value: payload.hostname },
+        { label: "VPN", value: payload.vpnType },
+        { label: "IP", value: payload.assignedIp },
+        { label: "모델", value: payload.deviceModel },
+      ].filter((field) => field.value !== undefined && field.value !== null && field.value !== ""),
+    },
+    {
+      title: "응답 정보",
+      fields: [
+        { label: "고객사", value: mockResponse.customerName || payload.customerName },
+        { label: "자산상태", value: mockResponse.assetStatus ?? payload.assetStatus },
+        { label: "판매유형", value: mockResponse.saleType ?? payload.saleType },
+      ].filter((field) => field.value !== undefined && field.value !== null && field.value !== ""),
+    },
+    {
+      title: "기타",
+      fields: [
+        { label: "모드", value: parsed.mode },
+        { label: "트리거", value: parsed.trigger },
+        { label: "라이선스", value: licenseInfo.available === undefined ? "" : (licenseInfo.available ? "있음" : "없음") },
+        { label: "메모", value: mockResponse.note || payload.note },
+      ].filter((field) => field.value !== undefined && field.value !== null && field.value !== ""),
+    },
+  ].filter((group) => group.fields.length > 0);
+
+  if (!groups.length) {
+    return null;
+  }
+  return { kind: "groups", groups };
+}
+
+function summarizeHistoryDetail(item) {
+  if (!item) return "-";
+  const eventLabel = String(item.eventLabel || "").trim().toLowerCase();
+  const summary = String(item.summary || "").trim().toLowerCase();
+  const detail = item.detail || "";
+  if (eventLabel === "customer-sync" || summary.includes("재고 동기화") || summary.includes("json")) {
+    return summarizeCustomerSyncDetail(detail) || { kind: "text", text: detail || "-" };
+  }
+  return { kind: "text", text: detail || "-" };
+}
+
+function renderHistoryDetail(item) {
+  const detail = summarizeHistoryDetail(item);
+  if (!detail || detail.kind === "text") {
+    return <p>{detail?.text || "-"}</p>;
+  }
+  return (
+    <div className="asset-history-detail-groups">
+      {detail.groups.map((group) => (
+        <div className="asset-history-detail-group" key={group.title}>
+          <div className="asset-history-detail-title">{group.title}</div>
+          <div className="asset-history-detail-fields">
+            {group.fields.map((field) => (
+              <div className="asset-history-detail-field" key={`${group.title}-${field.label}`}>
+                <span>{field.label}</span>
+                <strong>{field.value}</strong>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function AssetsPage({ assets = [], onAssetsChanged }) {
   const [search, setSearch] = useState(() => getStoredValue(STORAGE_KEYS.search, ""));
   const [assetStatus, setAssetStatus] = useState(() => getStoredValue(STORAGE_KEYS.assetStatus, "all"));
   const [licenseOption, setLicenseOption] = useState(() => getStoredValue(STORAGE_KEYS.licenseOption, "all"));
   const [deviceModel, setDeviceModel] = useState(() => getStoredValue(STORAGE_KEYS.deviceModel, "all"));
   const [selectedSerial, setSelectedSerial] = useState(() => getStoredValue(STORAGE_KEYS.selectedSerial, ""));
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [addMode, setAddMode] = useState("single");
+  const [manualSerialNumber, setManualSerialNumber] = useState("");
+  const [manualDeviceModel, setManualDeviceModel] = useState("");
+  const [bulkFile, setBulkFile] = useState(null);
+  const [addLoading, setAddLoading] = useState(false);
+  const [addError, setAddError] = useState("");
+  const [addSuccess, setAddSuccess] = useState("");
+  const [addResultErrors, setAddResultErrors] = useState([]);
+  const addModalCloseTimerRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -119,6 +230,118 @@ export default function AssetsPage({ assets = [] }) {
     };
   }, [assets, filteredAssets, deviceModel]);
 
+  useEffect(() => {
+    return () => {
+      if (addModalCloseTimerRef.current) {
+        window.clearTimeout(addModalCloseTimerRef.current);
+      }
+    };
+  }, []);
+
+  const clearAddModalCloseTimer = () => {
+    if (addModalCloseTimerRef.current) {
+      window.clearTimeout(addModalCloseTimerRef.current);
+      addModalCloseTimerRef.current = null;
+    }
+  };
+
+  const scheduleAddModalClose = () => {
+    clearAddModalCloseTimer();
+    addModalCloseTimerRef.current = window.setTimeout(() => {
+      closeAddModal();
+    }, 900);
+  };
+
+  const closeAddModal = () => {
+    clearAddModalCloseTimer();
+    setAddModalOpen(false);
+    setAddMode("single");
+    setManualSerialNumber("");
+    setManualDeviceModel("");
+    setBulkFile(null);
+    setAddLoading(false);
+    setAddError("");
+    setAddSuccess("");
+    setAddResultErrors([]);
+  };
+
+  const handleManualAddSubmit = async (event) => {
+    event.preventDefault();
+    if (!manualSerialNumber.trim() || !manualDeviceModel.trim() || addLoading) return;
+    clearAddModalCloseTimer();
+    setAddLoading(true);
+    setAddError("");
+    setAddSuccess("");
+    setAddResultErrors([]);
+    try {
+      await createEquipmentAssetManual({
+        serialNumber: manualSerialNumber.trim(),
+        deviceModel: manualDeviceModel.trim(),
+      });
+      setAddSuccess("장비가 등록되었습니다. 잠시 후 창이 닫힙니다.");
+      setManualSerialNumber("");
+      setManualDeviceModel("");
+      if (onAssetsChanged) {
+        await onAssetsChanged();
+      }
+      scheduleAddModalClose();
+    } catch (error) {
+      setAddError(error.message || "장비 등록에 실패했습니다.");
+    } finally {
+      setAddLoading(false);
+    }
+  };
+
+  const handleTemplateDownload = async () => {
+    setAddError("");
+    try {
+      const response = await downloadEquipmentAssetsTemplate();
+      const blob = await response.blob();
+      const objectUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = "equipment_assets_template.xlsx";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(objectUrl);
+    } catch (error) {
+      setAddError(error.message || "엑셀 양식 다운로드에 실패했습니다.");
+    }
+  };
+
+  const handleBulkUploadSubmit = async (event) => {
+    event.preventDefault();
+    if (!bulkFile || addLoading) return;
+    clearAddModalCloseTimer();
+    setAddLoading(true);
+    setAddError("");
+    setAddSuccess("");
+    setAddResultErrors([]);
+    try {
+      const result = await importEquipmentAssetsExcel(bulkFile);
+      const resultErrors = Array.isArray(result.errors) ? result.errors : [];
+      const summary = `등록 ${result.created || 0}건, 중복 ${result.duplicates || 0}건, 건너뜀 ${result.skipped || 0}건`;
+      setAddSuccess(
+        resultErrors.length
+          ? `${summary} / 오류 ${resultErrors.length}건을 확인해주세요.`
+          : `${summary} / 잠시 후 창이 닫힙니다.`,
+      );
+      setAddResultErrors(resultErrors);
+      setBulkFile(null);
+      if (onAssetsChanged) {
+        await onAssetsChanged();
+      }
+      if (!resultErrors.length) {
+        scheduleAddModalClose();
+      }
+    } catch (error) {
+      setAddError(error.message || "엑셀 업로드에 실패했습니다.");
+    } finally {
+      setAddLoading(false);
+    }
+  };
+
   return (
     <div className="page-grid">
       <div className="stats-grid compact-stats assets-stats-grid">
@@ -148,7 +371,7 @@ export default function AssetsPage({ assets = [] }) {
         </div>
       </div>
 
-      <div className="panel toolbar-panel toolbar-panel-inline">
+      <div className="panel toolbar-panel toolbar-panel-inline assets-toolbar-panel">
         <input
           className="input"
           placeholder="시리얼, 고객사명, 장비명·모델 검색"
@@ -183,6 +406,10 @@ export default function AssetsPage({ assets = [] }) {
           <option value="NP">NP 포함</option>
           <option value="WP">WP 포함</option>
         </select>
+
+        <button className="primary-btn" type="button" onClick={() => setAddModalOpen(true)}>
+          장비 추가
+        </button>
       </div>
 
       <div className="two-col-grid assets-layout">
@@ -282,7 +509,7 @@ export default function AssetsPage({ assets = [] }) {
                           <span>{formatDateTimeSeoul(item.createdAt)}</span>
                         </div>
                         <div className="asset-history-type">{item.eventLabel || "history"}</div>
-                        <p>{item.detail || "-"}</p>
+                        {renderHistoryDetail(item)}
                       </div>
                     ))
                   ) : (
@@ -304,6 +531,104 @@ export default function AssetsPage({ assets = [] }) {
           )}
         </div>
       </div>
+
+      {addModalOpen ? (
+        <div className="modal-overlay" onClick={closeAddModal}>
+          <div className="modal-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="panel-header-row">
+              <div>
+                <h3 className="panel-title">장비 추가</h3>
+                <p className="panel-description">단일 입력 또는 엑셀 업로드로 장비 시리얼을 등록합니다.</p>
+              </div>
+              <button className="ghost-btn" type="button" onClick={closeAddModal}>닫기</button>
+            </div>
+
+            <div className="tab-group">
+              <button
+                className={`tab-btn ${addMode === "single" ? "active" : ""}`}
+                type="button"
+                onClick={() => setAddMode("single")}
+              >
+                단일 입력
+              </button>
+              <button
+                className={`tab-btn ${addMode === "bulk" ? "active" : ""}`}
+                type="button"
+                onClick={() => setAddMode("bulk")}
+              >
+                엑셀 업로드
+              </button>
+            </div>
+
+            {addMode === "single" ? (
+              <form className="form-grid" onSubmit={handleManualAddSubmit}>
+                <div className="field-group">
+                  <label>입력 시리얼</label>
+                  <input
+                    className="input"
+                    value={manualSerialNumber}
+                    onChange={(event) => setManualSerialNumber(event.target.value)}
+                    placeholder="예: X01308DDMVCPK89"
+                  />
+                </div>
+                <div className="field-group">
+                  <label>장비명/모델</label>
+                  <input
+                    className="input"
+                    value={manualDeviceModel}
+                    onChange={(event) => setManualDeviceModel(event.target.value)}
+                    placeholder="예: XGS 88"
+                  />
+                </div>
+                <div className="button-group">
+                  <button
+                    className="primary-btn"
+                    type="submit"
+                    disabled={!manualSerialNumber.trim() || !manualDeviceModel.trim() || addLoading}
+                  >
+                    {addLoading ? "등록 중..." : "단일 등록"}
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <form className="form-grid" onSubmit={handleBulkUploadSubmit}>
+                <div className="button-group">
+                  <button className="ghost-btn" type="button" onClick={handleTemplateDownload}>
+                    엑셀 양식 다운로드
+                  </button>
+                </div>
+                <div className="field-group">
+                  <label>엑셀 파일(.xlsx)</label>
+                  <input
+                    className="input"
+                    type="file"
+                    accept=".xlsx"
+                    onChange={(event) => setBulkFile(event.target.files?.[0] || null)}
+                  />
+                </div>
+                <div className="button-group">
+                  <button className="primary-btn" type="submit" disabled={!bulkFile || addLoading}>
+                    {addLoading ? "업로드 중..." : "엑셀 업로드"}
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {addError ? <div className="error-text">{addError}</div> : null}
+            {addSuccess ? <div className="success-text">{addSuccess}</div> : null}
+            {addResultErrors.length ? (
+              <div className="modal-feedback-list">
+                <strong className="error-text">업로드 오류 목록</strong>
+                <ul className="modal-error-list">
+                  {addResultErrors.map((message, index) => (
+                    <li key={`${message}-${index}`}>{message}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

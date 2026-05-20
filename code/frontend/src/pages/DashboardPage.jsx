@@ -29,6 +29,12 @@ function buildExpireRows(clients) {
     .slice(0, 8);
 }
 
+function serviceBadgeMeta(status) {
+  return status === "running"
+    ? { tone: "normal", label: "정상" }
+    : { tone: "stopped", label: "중지" };
+}
+
 export default function DashboardPage({ clients = [], services = [] }) {
   const expireRows = buildExpireRows(clients);
   const activeClients = clients.filter((client) => client.status === "active").length;
@@ -48,15 +54,18 @@ export default function DashboardPage({ clients = [], services = [] }) {
         <div className="panel">
           <h3 className="panel-title">서비스 상태</h3>
           <div className="list-wrap">
-            {services.map((service) => (
-              <div key={service.name} className="list-row">
-                <div>
-                  <div className="row-title">{service.name}</div>
-                  <div className="row-sub">{service.port}</div>
+            {services.map((service) => {
+              const badge = serviceBadgeMeta(service.status);
+              return (
+                <div key={service.name} className="list-row">
+                  <div>
+                    <div className="row-title">{service.name}</div>
+                    <div className="row-sub">{service.port}</div>
+                  </div>
+                  <StatusBadge tone={badge.tone} label={badge.label} />
                 </div>
-                <StatusBadge status={service.status} />
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
