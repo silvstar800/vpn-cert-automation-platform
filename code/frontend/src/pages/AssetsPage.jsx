@@ -147,6 +147,14 @@ function renderHistoryDetail(item) {
   );
 }
 
+function renderHistoryHostname(item, fallbackHostname = "") {
+  const hostname = String(item?.hostname || fallbackHostname || "").trim();
+  if (!hostname) {
+    return null;
+  }
+  return <span className="asset-history-hostname">호스트 {hostname}</span>;
+}
+
 export default function AssetsPage({ assets = [], onAssetsChanged }) {
   const [search, setSearch] = useState(() => getStoredValue(STORAGE_KEYS.search, ""));
   const [assetStatus, setAssetStatus] = useState(() => getStoredValue(STORAGE_KEYS.assetStatus, "all"));
@@ -481,6 +489,7 @@ export default function AssetsPage({ assets = [], onAssetsChanged }) {
 
                 <div className="detail-list">
                   <div className="detail-row"><span>시리얼</span><strong>{selectedAsset.serialNumber}</strong></div>
+                  <div className="detail-row"><span>호스트명</span><strong>{selectedAsset.hostname || "-"}</strong></div>
                   <div className="detail-row"><span>고객사명</span><strong>{selectedAsset.customerName || "외부 연동 대기"}</strong></div>
                   <div className="detail-row"><span>장비명/모델</span><strong>{selectedAsset.deviceModel || "-"}</strong></div>
                   <div className="detail-row"><span>라이선스 종류</span><strong>{(selectedAsset.licenseLabels || ["기본"]).join(", ")}</strong></div>
@@ -508,6 +517,7 @@ export default function AssetsPage({ assets = [], onAssetsChanged }) {
                           <strong>{item.summary || "장비 이력"}</strong>
                           <span>{formatDateTimeSeoul(item.createdAt)}</span>
                         </div>
+                        {renderHistoryHostname(item, selectedAsset.hostname)}
                         <div className="asset-history-type">{item.eventLabel || "history"}</div>
                         {renderHistoryDetail(item)}
                       </div>

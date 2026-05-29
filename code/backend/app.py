@@ -1,4 +1,4 @@
-﻿import base64
+import base64
 import glob
 import hashlib
 import hmac
@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 
 import models
 from db import Base as DBBase, engine as DB_ENGINE, get_db
-from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, EquipmentAssetManager, RestoreExecutionError
+from managers import AlertManager, MonitoringManager, SecurityManager, IPLeaseManager, EnrollManager, VPNConfigManager, BackupManager, EquipmentAssetManager, OfflineQueueManager, RestoreExecutionError
 from managers.security_manager import RateLimitExceeded
 from schemas import (
     EnrollPayload, EnrollApcPayload, AdminApcPayload,
@@ -129,6 +129,9 @@ SERVER_DN = os.environ.get("SERVER_DN", "CN=OpenVPN-CA")
 SFOS_SERVER_DN = os.environ.get("SFOS_SERVER_DN", "CN=server")
 ENROLL_SCRIPT_SERVER_IP = os.environ.get("ENROLL_SCRIPT_SERVER_IP", "").strip()
 ENROLL_PUBLIC_BASE_URL = os.environ.get("ENROLL_PUBLIC_BASE_URL", "").strip().rstrip("/")
+SERVER_DOMAIN = os.environ.get("SERVER_DOMAIN", "").strip()
+if not ENROLL_PUBLIC_BASE_URL and SERVER_DOMAIN:
+    ENROLL_PUBLIC_BASE_URL = f"https://{SERVER_DOMAIN}"
 FRONTEND_ORIGINS = [
     origin.strip()
     for origin in os.environ.get(
@@ -253,6 +256,9 @@ VPN_CFG_MGR = VPNConfigManager(
 
 # Initialize BackupManager
 BACKUP_MGR = BackupManager(backup_base_dir=BACKUP_BASE_DIR, cipher_secret=BACKUP_CONFIG_SECRET)
+
+# Initialize OfflineQueueManager
+OFFLINE_QUEUE_MGR = OfflineQueueManager(queue_dir="/opt/certsvc/offline-queue")
 
 # Initialize AlertManager
 ALERT_MGR = AlertManager(
@@ -1640,17 +1646,17 @@ def build_restore_service_checklist() -> list[dict]:
         return result.returncode == 0 and result.stdout.strip() == "active"
 
     checklist = [
-        {"name": "postgresql.service", "ok": active("postgresql.service"), "detail": "PostgreSQL 데이터베이스 서비스 상태"},
-        {"name": "nginx.service", "ok": active("nginx.service"), "detail": "HTTPS 프록시 및 정적 UI 서비스 상태"},
-        {"name": "certsvc.service", "ok": active("certsvc.service"), "detail": "FastAPI 백엔드 서비스 상태"},
-        {"name": "openvpn-server@server.service", "ok": active("openvpn-server@server.service"), "detail": "일반 SG OpenVPN 서비스 상태"},
-        {"name": "openvpn-server@server-legacy.service", "ok": active("openvpn-server@server-legacy.service"), "detail": "레거시 SG OpenVPN 서비스 상태"},
-        {"name": "openvpn-server@server-sfos.service", "ok": active("openvpn-server@server-sfos.service"), "detail": "SFOS OpenVPN 서비스 상태"},
-        {"name": "PKI 디렉터리", "ok": Path(PKI).exists(), "detail": PKI},
-        {"name": "CCD 디렉터리", "ok": Path(CCD).exists(), "detail": CCD},
-        {"name": "CCD Legacy 디렉터리", "ok": Path(CCD_LEGACY).exists(), "detail": CCD_LEGACY},
-        {"name": "CCD SFOS 디렉터리", "ok": Path(CCD_SFOS).exists(), "detail": CCD_SFOS},
-        {"name": ".env 파일", "ok": Path(APP_ENV_FILE).exists(), "detail": APP_ENV_FILE},
+        {"name": "postgresql.service", "ok": active("postgresql.service"), "detail": "PostgreSQL 데이터베이스 서비스 상태", "critical": True},
+        {"name": "nginx.service", "ok": active("nginx.service"), "detail": "HTTPS 프록시 및 정적 UI 서비스 상태", "critical": True},
+        {"name": "certsvc.service", "ok": active("certsvc.service"), "detail": "FastAPI 백엔드 서비스 상태", "critical": True},
+        {"name": "openvpn-server@server.service", "ok": active("openvpn-server@server.service"), "detail": "일반 SG OpenVPN 서비스 상태", "critical": True},
+        {"name": "openvpn-server@server-legacy.service", "ok": active("openvpn-server@server-legacy.service"), "detail": "레거시 SG OpenVPN 서비스 상태", "critical": True},
+        {"name": "openvpn-server@server-sfos.service", "ok": active("openvpn-server@server-sfos.service"), "detail": "SFOS OpenVPN 서비스 상태", "critical": True},
+        {"name": "PKI 디렉터리", "ok": Path(PKI).exists(), "detail": PKI, "critical": True},
+        {"name": "CCD 디렉터리", "ok": Path(CCD).exists(), "detail": CCD, "critical": True},
+        {"name": "CCD Legacy 디렉터리", "ok": Path(CCD_LEGACY).exists(), "detail": CCD_LEGACY, "critical": True},
+        {"name": "CCD SFOS 디렉터리", "ok": Path(CCD_SFOS).exists(), "detail": CCD_SFOS, "critical": True},
+        {"name": ".env 파일", "ok": Path(APP_ENV_FILE).exists(), "detail": APP_ENV_FILE, "critical": True},
     ]
 
     health_ok = False
@@ -1665,7 +1671,7 @@ def build_restore_service_checklist() -> list[dict]:
         except Exception as exc:
             health_detail = str(exc)
             threading.Event().wait(1)
-    checklist.append({"name": "certsvc /health", "ok": health_ok, "detail": health_detail})
+    checklist.append({"name": "certsvc /health", "ok": health_ok, "detail": health_detail, "critical": True})
 
     for path, label in [
         ("/clients", "클라이언트 목록 API"),
@@ -1683,7 +1689,7 @@ def build_restore_service_checklist() -> list[dict]:
             except Exception as exc:
                 detail = str(exc)
                 threading.Event().wait(1)
-        checklist.append({"name": label, "ok": ok, "detail": detail})
+        checklist.append({"name": label, "ok": ok, "detail": detail, "critical": False})
     return checklist
 
 
@@ -1701,7 +1707,11 @@ def build_restore_preflight_summary(bundle_dir: Path | None, validation: dict | 
             bundle_size_bytes = 0
     required_free_bytes = max(bundle_size_bytes * 2, 512 * 1024 * 1024)
     service_checklist = build_restore_service_checklist()
-    failed_checks = [item.get("name") for item in service_checklist if not item.get("ok")]
+    failed_checks = [
+        item.get("name")
+        for item in service_checklist
+        if not item.get("ok") and item.get("critical", True)
+    ]
     ready = bool(validation.get("valid", True)) and usage.free >= required_free_bytes and not failed_checks
     return {
         "ready": ready,
@@ -1731,7 +1741,7 @@ def apply_restored_backup_bundle(bundle_dir: Path) -> dict:
         ccd_dir=CCD,
         ccd_legacy_dir=CCD_LEGACY,
         ccd_sfos_dir=CCD_SFOS,
-        openvpn_conf_path=OPENVPN_CONF,
+        openvpn_conf_path=OPENVPN_SERVER_CONF,
         app_root_dir=str(APP_ROOT_DIR),
         app_env_file=APP_ENV_FILE,
         database_url=os.environ["DATABASE_URL"],
@@ -2225,9 +2235,9 @@ def try_send_configured_slack_message(
     if not record.slack_enabled or not record.slack_bot_token_enc:
         return
     channel = (record.slack_channel or SECURITY_SLACK_DEFAULT_CHANNEL).strip() or SECURITY_SLACK_DEFAULT_CHANNEL
-    bot_token = decrypt_backup_secret(record.slack_bot_token_enc)
-    text, blocks = build_slack_test_payload(template_type, payload=payload)
     try:
+        bot_token = decrypt_backup_secret(record.slack_bot_token_enc)
+        text, blocks = build_slack_test_payload(template_type, payload=payload)
         send_slack_message(bot_token, channel, text, blocks)
         try:
             with Session(DB_ENGINE) as db:
@@ -2497,7 +2507,7 @@ def write_openvpn_bundle(
 
 
 def collect_runtime_service_statuses() -> list[dict]:
-    """Collect runtime service status snapshot using the same rules as the UI."""
+    """Collect runtime service status snapshot based on service liveness."""
     db_ok = True
     try:
         with DB_ENGINE.connect() as conn:
@@ -2505,18 +2515,8 @@ def collect_runtime_service_statuses() -> list[dict]:
     except SQLAlchemyError:
         db_ok = False
 
-    conn_sets = VPN_CFG_MGR.collect_connection_sets(
-        openvpn_server_conf=OPENVPN_SERVER_CONF,
-        openvpn_status_file=OPENVPN_STATUS_FILE,
-        openvpn_legacy_status_file=OPENVPN_LEGACY_STATUS_FILE,
-        sfos_server_conf=SFOS_SERVER_CONF,
-        sfos_status_file=SFOS_STATUS_FILE,
-    )
     return VPN_CFG_MGR.build_runtime_service_statuses(
         db_ok=db_ok,
-        openvpn_connected_count=len(conn_sets["openvpnConnected"]),
-        openvpn_legacy_connected_count=len(conn_sets["openvpnLegacyConnected"]),
-        sfos_connected_count=len(conn_sets["sfosConnected"]),
         openvpn_port=OPENVPN_PORT,
         openvpn_legacy_port=OPENVPN_LEGACY_PORT,
         sfos_vpn_port=SFOS_VPN_PORT,
@@ -2650,6 +2650,25 @@ def startup_runtime() -> None:
     ensure_backup_schema()
     ensure_backup_scheduler_started()
     ensure_alert_monitor_started()
+
+    # Process offline queue if any files exist
+    db_gen = None
+    try:
+        db_gen = get_db()
+        db = next(db_gen)
+        results = OFFLINE_QUEUE_MGR.process_offline_queue(db)
+        if results["processed"] > 0:
+            LOGGER.info(f"Offline queue processing: {results['succeeded']} succeeded, {results['failed']} failed")
+            if results["errors"]:
+                LOGGER.warning(f"Offline queue errors: {results['errors']}")
+    except Exception as e:
+        LOGGER.warning(f"Failed to process offline queue on startup: {e}", exc_info=True)
+    finally:
+        if db_gen is not None:
+            try:
+                db_gen.close()
+            except Exception:
+                pass
 
 
 @app.get("/health")
@@ -3294,67 +3313,17 @@ def system_status(
     db: Session = Depends(get_db),
 ):
     """Return service statuses and host resource metrics."""
-    def service_active(service_name: str) -> bool:
-        """Check whether a systemd service is active."""
-        result = subprocess.run(
-            ["systemctl", "is-active", service_name],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        return result.returncode == 0 and result.stdout.strip() == "active"
-
     db_ok = True
     try:
         db.execute(text("SELECT 1"))
     except Exception:
         db_ok = False
-
-    openvpn_status_path = VPN_CFG_MGR.resolve_openvpn_status_file(OPENVPN_SERVER_CONF, OPENVPN_STATUS_FILE, openvpn_server_conf=OPENVPN_SERVER_CONF, sfos_server_conf=SFOS_SERVER_CONF)
-    openvpn_legacy_status_path = OPENVPN_LEGACY_STATUS_FILE
-    sfos_status_path = VPN_CFG_MGR.resolve_openvpn_status_file(SFOS_SERVER_CONF, SFOS_STATUS_FILE, openvpn_server_conf=OPENVPN_SERVER_CONF, sfos_server_conf=SFOS_SERVER_CONF)
-    openvpn_connected = VPN_CFG_MGR.read_openvpn_connected_cns(openvpn_status_path)
-    openvpn_legacy_connected = VPN_CFG_MGR.read_openvpn_connected_cns(openvpn_legacy_status_path)
-    sfos_connected = VPN_CFG_MGR.read_openvpn_connected_cns(sfos_status_path)
-
-    openvpn_service_up = service_active("openvpn-server@server.service")
-    openvpn_legacy_service_up = service_active("openvpn-server@server-legacy.service")
-    sfos_service_up = service_active("openvpn-server@server-sfos.service")
-
-    services = [
-        {
-            "name": "openvpn-server@server",
-            "status": (
-                "active"
-                if openvpn_service_up and len(openvpn_connected) > 0
-                else ("disconnected" if openvpn_service_up else "stopped")
-            ),
-            "port": f"{OPENVPN_PORT}/udp",
-        },
-        {
-            "name": "openvpn-server@server-legacy",
-            "status": (
-                "active"
-                if openvpn_legacy_service_up and len(openvpn_legacy_connected) > 0
-                else ("disconnected" if openvpn_legacy_service_up else "stopped")
-            ),
-            "port": f"{OPENVPN_LEGACY_PORT}/udp",
-        },
-        {
-            "name": "openvpn-server@sfos",
-            "status": (
-                "active"
-                if sfos_service_up and len(sfos_connected) > 0
-                else ("disconnected" if sfos_service_up else "stopped")
-            ),
-            "port": f"{SFOS_VPN_PORT}/tcp",
-        },
-        {
-            "name": "certsvc-db",
-            "status": "running" if db_ok else "stopped",
-            "port": "5432/tcp",
-        },
-    ]
+    services = VPN_CFG_MGR.build_runtime_service_statuses(
+        db_ok=db_ok,
+        openvpn_port=OPENVPN_PORT,
+        openvpn_legacy_port=OPENVPN_LEGACY_PORT,
+        sfos_vpn_port=SFOS_VPN_PORT,
+    )
     return {
         "services": services,
         "resources": MONITOR.get_resource_usage(),
@@ -4046,7 +4015,7 @@ def enroll(request: Request, data: EnrollPayload, db: Session = Depends(get_db))
                 client_id=client.id,
                 event_type=ASSET_HISTORY_ENROLL,
                 event_summary="SSL enroll로 장비 정보가 반영되었습니다.",
-                event_detail=f"{hostname} 장비에서 수집한 시리얼 {serial_number} 정보가 자동 반영되었습니다.",
+                event_detail=f"호스트명 {hostname} 장비에서 수집한 시리얼 {serial_number} 정보가 자동 반영되었습니다.",
                 created_by="enroll",
             )
             if asset is not None:
@@ -4189,7 +4158,7 @@ def apc(
                 client_id=existing_client.id,
                 event_type=ASSET_HISTORY_APC,
                 event_summary="APC enroll로 장비 정보가 반영되었습니다.",
-                event_detail=f"{hostname} 장비의 APC 등록 시 시리얼 {serial_number} / 모델 {device_model or '-'} 정보가 반영되었습니다.",
+                event_detail=f"호스트명 {hostname} 장비의 APC 등록 시 시리얼 {serial_number} / 모델 {device_model or '-'} 정보가 반영되었습니다.",
                 created_by="apc-enroll",
             )
             db.flush()
@@ -4325,7 +4294,7 @@ def admin_apc_request(
                 client_id=existing_client.id,
                 event_type=ASSET_HISTORY_APC,
                 event_summary="관리자 APC 요청으로 장비 정보가 반영되었습니다.",
-                event_detail=f"관리자 APC 생성 요청에서 시리얼 {serial_number} / 모델 {device_model or '-'} 정보가 반영되었습니다.",
+                event_detail=f"호스트명 {hostname} 관리자 APC 생성 요청에서 시리얼 {serial_number} / 모델 {device_model or '-'} 정보가 반영되었습니다.",
                 created_by="admin-apc",
             )
             db.flush()

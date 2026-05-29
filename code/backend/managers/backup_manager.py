@@ -435,6 +435,33 @@ class BackupManager:
     # ========================================
 
     @staticmethod
+    def resolve_postgres_tool(tool_name: str, env_var: str) -> str:
+        """Resolve PostgreSQL CLI tool path, preferring explicit env then highest installed major version."""
+        override = (os.environ.get(env_var, "") or "").strip()
+        if override:
+            return override
+
+        base_dir = Path("/usr/lib/postgresql")
+        candidates: list[tuple[int, str]] = []
+        if base_dir.exists():
+            for version_dir in base_dir.iterdir():
+                if not version_dir.is_dir():
+                    continue
+                try:
+                    major = int(version_dir.name.split(".", 1)[0])
+                except ValueError:
+                    continue
+                tool_path = version_dir / "bin" / tool_name
+                if tool_path.exists() and os.access(tool_path, os.X_OK):
+                    candidates.append((major, str(tool_path)))
+
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+
+        detected = shutil.which(tool_name)
+        return detected or tool_name
+
+    @staticmethod
     def build_pg_dump_command(database_url: str, output_path: Path) -> Tuple[list[str], dict[str, str]]:
         """Convert SQLAlchemy DATABASE_URL into pg_dump CLI arguments."""
         parsed = make_url(database_url)
@@ -446,8 +473,9 @@ class BackupManager:
         if not database or not username:
             raise RuntimeError("DATABASE_URL must include username and database name")
 
+        dump_bin = BackupManager.resolve_postgres_tool("pg_dump", "PG_DUMP_BIN")
         command = [
-            "pg_dump",
+            dump_bin,
             "--format=custom",
             "--file",
             str(output_path),
@@ -476,8 +504,9 @@ class BackupManager:
         if not database or not username:
             raise RuntimeError("DATABASE_URL must include username and database name")
 
+        restore_bin = BackupManager.resolve_postgres_tool("pg_restore", "PG_RESTORE_BIN")
         command = [
-            "pg_restore",
+            restore_bin,
             "--clean",
             "--if-exists",
             "--no-owner",
@@ -495,6 +524,19 @@ class BackupManager:
         env = os.environ.copy()
         env["PGPASSWORD"] = parsed.password or ""
         return command, env
+
+    @staticmethod
+    def format_pg_restore_failure(exc: subprocess.CalledProcessError, input_path: Path) -> str:
+        """Return a readable restore error with the original stderr attached."""
+        stderr = (exc.stderr or exc.stdout or "").strip()
+        detail = stderr or f"pg_restore failed with exit code {exc.returncode}"
+        if "unsupported version" in stderr.lower() or "file header" in stderr.lower():
+            detail += (
+                f"\nbackup file: {input_path}\n"
+                "hint: this usually means the local pg_restore is older than the dump. "
+                "Install PostgreSQL client tools that are the same major version as the backup, or newer."
+            )
+        return detail
 
     @staticmethod
     def validate_tar_archive(path: Path) -> None:
@@ -550,12 +592,18 @@ class BackupManager:
         if not db_dump_path.exists():
             raise RuntimeError("db.dump is missing")
 
-        restore_list = subprocess.run(
-            ["pg_restore", "--list", str(db_dump_path)],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        try:
+            restore_bin = BackupManager.resolve_postgres_tool("pg_restore", "PG_RESTORE_BIN")
+            restore_list = subprocess.run(
+                [restore_bin, "--list", str(db_dump_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            detail = BackupManager.format_pg_restore_failure(exc, db_dump_path)
+            checks.append({"name": "DB 덤프 검증", "status": "failed", "detail": detail})
+            raise RuntimeError(f"db.dump validation failed: {detail}") from exc
         restore_lines = [line for line in restore_list.stdout.splitlines() if line.strip()]
         checks.append({
             "name": "DB 덤프 검증",
@@ -653,7 +701,7 @@ class BackupManager:
             ("ccd_sfos.tar.gz", Path(ccd_sfos_dir), set()),
             ("openvpn_conf.tar.gz", Path(openvpn_conf_path).parent, set()),
             ("env.tar.gz", Path(app_env_file), set()),
-            ("ui.tar.gz", app_ui_dir, {"node_modules", "release_snapshots", "dist.bak", "dist.pre_rollback", "dist.bad_rollback", "dist.current_wrong", "__pycache__"}),
+            ("ui.tar.gz", Path(app_ui_dir), {"node_modules", "release_snapshots", "dist.bak", "dist.pre_rollback", "dist.bad_rollback", "dist.current_wrong", "__pycache__"}),
         ]
 
         for archive_name, source_path, exclude_names in archive_targets:
@@ -684,9 +732,9 @@ class BackupManager:
         stages = []
         restore_point = None
 
+        # Keep API/proxy services alive while handling a web-triggered restore request.
+        # Stopping certsvc/nginx mid-request causes browser-side "Failed to fetch".
         stopped_services = [
-            "nginx.service",
-            "certsvc.service",
             "openvpn-server@server.service",
             "openvpn-server@server-legacy.service",
             "openvpn-server@server-sfos.service",
@@ -709,7 +757,15 @@ class BackupManager:
 
             db_dump_path = bundle_dir / "db.dump"
             restore_command, restore_env = BackupManager.build_pg_restore_command(database_url, db_dump_path)
-            subprocess.run(restore_command, check=True, capture_output=True, text=True, env=restore_env)
+            try:
+                subprocess.run(restore_command, check=True, capture_output=True, text=True, env=restore_env)
+            except subprocess.CalledProcessError as exc:
+                detail = BackupManager.format_pg_restore_failure(exc, db_dump_path)
+                BackupManager.append_restore_stage(stages, "DB 복구", "failed", detail)
+                raise RestoreExecutionError(
+                    f"DB 복구 실패: {detail}",
+                    {"restorePoint": str(restore_point), "stages": stages, "restartedServices": restarted_services},
+                ) from exc
             BackupManager.append_restore_stage(stages, "DB 복구", "success", str(db_dump_path))
 
             archive_map = [
@@ -754,13 +810,7 @@ class BackupManager:
                 {"restorePoint": str(restore_point) if restore_point else "", "stages": stages, "restartedServices": restarted_services},
             ) from exc
         finally:
-            for service in [
-                "openvpn-server@server.service",
-                "openvpn-server@server-legacy.service",
-                "openvpn-server@server-sfos.service",
-                "certsvc.service",
-                "nginx.service",
-            ]:
+            for service in stopped_services:
                 ok, detail = BackupManager.run_systemctl_action(service, "start")
                 BackupManager.append_restore_stage(stages, f"{service} 시작", "success" if ok else "failed", detail)
                 restarted_services.append(service)

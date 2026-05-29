@@ -392,6 +392,8 @@ class VPNConfigManager:
                     if src.suffix == ".sh":
                         content = src.read_text(encoding="utf-8")
                         content = content.replace("__FW_GUARD__", "/usr/local/sbin/certsvc-ensure-fw.sh")
+                        content = content.replace("__STARTER__", "/usr/local/sbin/chroot-openvpn-start.sh")
+                        content = content.replace("__STOPPER__", "/usr/local/sbin/chroot-openvpn-stop.sh")
                         content = content.replace("__SERVER_IP__", server_ip)
                         content = content.replace("__VPN_PORT__", str(int(vpn_port or default_port)))
                         if api_port:
@@ -505,14 +507,11 @@ class VPNConfigManager:
         self,
         *,
         db_ok: bool,
-        openvpn_connected_count: int,
-        openvpn_legacy_connected_count: int,
-        sfos_connected_count: int,
         openvpn_port: int,
         openvpn_legacy_port: int,
         sfos_vpn_port: int,
     ) -> list[dict]:
-        """Build runtime service status rows for security monitoring."""
+        """Build runtime service status rows from service liveness only."""
         openvpn_service_up = self.is_systemd_service_active("openvpn-server@server.service")
         openvpn_legacy_service_up = self.is_systemd_service_active("openvpn-server@server-legacy.service")
         sfos_service_up = self.is_systemd_service_active("openvpn-server@server-sfos.service")
@@ -520,21 +519,21 @@ class VPNConfigManager:
         return [
             {
                 "name": "openvpn-server@server",
-                "status": "active" if openvpn_service_up and openvpn_connected_count > 0 else ("disconnected" if openvpn_service_up else "stopped"),
+                "status": "running" if openvpn_service_up else "stopped",
                 "port": f"{openvpn_port}/udp",
-                "nominal": "active",
+                "nominal": "running",
             },
             {
                 "name": "openvpn-server@server-legacy",
-                "status": "active" if openvpn_legacy_service_up and openvpn_legacy_connected_count > 0 else ("disconnected" if openvpn_legacy_service_up else "stopped"),
+                "status": "running" if openvpn_legacy_service_up else "stopped",
                 "port": f"{openvpn_legacy_port}/udp",
-                "nominal": "active",
+                "nominal": "running",
             },
             {
                 "name": "openvpn-server@sfos",
-                "status": "active" if sfos_service_up and sfos_connected_count > 0 else ("disconnected" if sfos_service_up else "stopped"),
+                "status": "running" if sfos_service_up else "stopped",
                 "port": f"{sfos_vpn_port}/tcp",
-                "nominal": "active",
+                "nominal": "running",
             },
             {
                 "name": "certsvc-db",

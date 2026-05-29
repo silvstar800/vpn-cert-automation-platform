@@ -153,6 +153,18 @@ class EquipmentAssetManager:
         hostname: str = "",
     ) -> dict:
         """Serialize an equipment asset and optional history rows for the frontend."""
+        effective_hostname = (hostname or "").strip()
+
+        def decorate_history_detail(detail: str | None) -> str:
+            text = (detail or "").strip()
+            if not effective_hostname:
+                return text
+            if not text:
+                return f"호스트명 {effective_hostname}"
+            if "호스트명" in text or effective_hostname in text:
+                return text
+            return f"호스트명 {effective_hostname} | {text}"
+
         raw_customer_name = " ".join((asset.customer_name or "").strip().split())
         has_real_customer_name = self.is_meaningful_customer_name(raw_customer_name)
         sync_status = int(asset.customer_sync_status or 0)
@@ -167,7 +179,7 @@ class EquipmentAssetManager:
         return {
             "id": asset.id,
             "serialNumber": asset.serial_number,
-            "hostname": (hostname or "").strip(),
+            "hostname": effective_hostname,
             "customerName": raw_customer_name or "외부 연동 대기",
             "customerSyncStatus": effective_sync_status,
             "customerSyncLabel": ASSET_CUSTOMER_SYNC_LABELS.get(
@@ -191,9 +203,10 @@ class EquipmentAssetManager:
                     "eventType": int(row.event_type or 0),
                     "eventLabel": ASSET_EVENT_TYPE_LABELS.get(int(row.event_type or 0), "history"),
                     "summary": row.summary or "",
-                    "detail": row.detail or "",
+                    "detail": decorate_history_detail(row.detail),
                     "createdBy": row.created_by or "system",
                     "createdAt": self._to_kst_iso(row.created_at),
+                    "hostname": effective_hostname,
                 }
                 for row in (history_rows or [])
             ],
@@ -252,23 +265,19 @@ class EquipmentAssetManager:
         *,
         created_by: str = "inventory-sync",
     ) -> models.EquipmentAsset:
-        """Apply external inventory sync data to an existing equipment asset."""
+        """Apply external inventory sync data to an existing equipment asset by serial only."""
         serial_number = str(
             payload.get("serialNumber")
             or payload.get("serial_number")
             or ""
         ).strip().upper()
-        hostname = str(payload.get("hostname") or payload.get("hostName") or "").strip()
 
-        asset = None
-        if serial_number:
-            asset = db.query(models.EquipmentAsset).filter_by(serial_number=serial_number).first()
-        if asset is None and hostname:
-            client = db.query(models.Client).filter_by(hostname=hostname).first()
-            if client is not None:
-                asset = db.query(models.EquipmentAsset).filter_by(client_id=client.id).first()
+        if not serial_number:
+            raise ValueError("serialNumber is required")
+
+        asset = db.query(models.EquipmentAsset).filter_by(serial_number=serial_number).first()
         if asset is None:
-            raise ValueError("matching equipment asset not found")
+            raise ValueError(f"matching equipment asset not found for serial: {serial_number}")
 
         changed_fields: list[str] = []
         sync_status_value = payload.get("customerSyncStatus")

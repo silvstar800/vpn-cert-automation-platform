@@ -781,6 +781,14 @@ select {
   margin-bottom: 8px;
 }
 
+.asset-history-hostname {
+  display: inline-block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+
 .asset-history-type {
   font-size: 12px;
   color: var(--accent);

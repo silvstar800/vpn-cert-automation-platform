@@ -8,6 +8,7 @@ from .vpn_config_manager import VPNConfigManager
 from .monitoring_manager import MonitoringManager
 from .backup_manager import BackupManager, RestoreExecutionError
 from .equipment_manager import EquipmentAssetManager
+from .offline_queue_manager import OfflineQueueManager
 
 __all__ = [
     "AlertManager",
@@ -19,4 +20,5 @@ __all__ = [
     "BackupManager",
     "RestoreExecutionError",
     "EquipmentAssetManager",
+    "OfflineQueueManager",
 ]
